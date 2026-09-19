@@ -28,9 +28,16 @@ FlyWire はオスとメスを比べるための対照。
 ## 使い方
 
 ```powershell
-cd C:\Users\seeton\fly
+git clone https://github.com/seeton/fly.git
+cd fly
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+python scripts\00_fetch_data.py      # 公開データを取得 (78 MB, --all で 7.7 GB)
 .\.venv\Scripts\Activate.ps1
 ```
+
+`data/` (生データ) と `out/` (動画・3D HTML) は大きいのでリポジトリには入れていない。
+どちらも上の取得スクリプトと `scripts/` の実行で作り直せる。
 
 (有効化せずに `.\.venv\Scripts\python.exe` を直接叩いてもよい)
 
@@ -430,7 +437,8 @@ fly/
 │  ├─ 14_render_flight.py       学習した飛び方を録画
 │  ├─ 15_bootstrap_flight.py    学習の出発点をランダム探索+CMA-ESで探す
 │  ├─ insect_aero.py           準定常翼素理論の空力 (Sane & Dickinson)
-│  └─ 16_validate_aero.py      空力の検証 (揚力・パワー・姿勢)
+│  ├─ 16_validate_aero.py      空力の検証 (揚力・パワー・姿勢)
+│  └─ 17_seed_gains.py         制御ゲインの初期値探し
 ├─ app/
 │  ├─ server.py                 FastAPI バックエンド
 │  └─ static/index.html         フロントエンド
@@ -463,11 +471,3 @@ fly/
   https://www.janelia.org/project-team/flyem/male-cns-connectome
 - hemibrain — Scheffer et al. (2020) *eLife* (CC BY 4.0)
 - FlyWire 注釈 — Schlegel et al. / Dorkenwald et al. (2024) *Nature* (CC BY 4.0)
-
-## 環境を作り直す場合
-
-```powershell
-uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-python scripts\00_fetch_data.py --all
-```

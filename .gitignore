@@ -16,3 +16,6 @@ MUJOCO_LOG.TXT
 !out/
 out/*
 !out/*.json
+
+# Claude 用のローカルメモ
+CLAUDE.md
