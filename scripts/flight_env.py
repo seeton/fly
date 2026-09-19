@@ -88,6 +88,12 @@ def get_model():
         # 翅は準定常翼素理論 (insect_aero) が担当。胴体の空気抵抗は MuJoCo に残す。
         aero = WingAero(m, n_elem=N_ELEM)
         aero.route_wings_to_this_model(m)
+        # 付加質量は明示的な力ではなく慣性として入れる (エネルギー保存)
+        i_add = aero.added_mass_inertia(m)
+        for jn in ("wing_roll_left", "wing_roll_right",
+                   "wing_yaw_left", "wing_yaw_right"):
+            adr = m.jnt_dofadr[m.joint(jn).id]
+            m.dof_armature[adr] += i_add
         _MODEL = m
         _AERO = aero
     return _MODEL

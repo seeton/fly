@@ -53,7 +53,17 @@ class WingAero:
     GEOMS = ("wing_left_fluid", "wing_right_fluid")
 
     def __init__(self, model, n_elem: int = 6, rho: float = 1.28e-3,
-                 use_rotational: bool = True, use_added_mass: bool = True):
+                 use_rotational: bool = True, use_added_mass: bool = False):
+        """use_added_mass は既定で False。
+
+        付加質量を「前ステップとの差分で法線加速度を出す明示的な力」として
+        与えると、迎角の急反転時に力が速度と同相になり、**静止空気から
+        エネルギーを取り出せてしまう**。実際 CMA-ES はその抜け穴を見つけ、
+        空気へのパワー -1999 erg/s (定常飛行では必ず正のはず) の解を作った。
+
+        付加質量は本来ただの慣性なので、`added_mass_inertia()` が返す値を
+        翅関節の armature に足す形で入れる。こちらはエネルギーを保存する。
+        """
         import mujoco
 
         self.rho = rho
@@ -202,6 +212,25 @@ class WingAero:
         self.air_power = air_power
         self._have_prev = True
 
+    def added_mass_inertia(self, model) -> float:
+        """ストローク軸まわりの付加質量の慣性 [g cm^2]。
+
+        翼素ごとに単位長あたり rho*pi/4*c^2 の付加質量があるとして、
+        ヒンジからの距離 r の2乗をかけて積分する。
+        これを armature に足せば、付加質量をエネルギー保存の形で扱える。
+        """
+        import mujoco
+
+        d = mujoco.MjData(model)
+        mujoco.mj_forward(model, d)
+        gid, bid = self.gids[0], self.bids[0]
+        R = d.geom_xmat[gid].reshape(3, 3)
+        hinge = d.xpos[bid]
+        pts = d.geom_xpos[gid][None, :] + self.z[:, None] * R[:, 2][None, :]
+        r = np.linalg.norm(pts - hinge[None, :], axis=1)
+        return float(np.sum(self.rho * np.pi / 4.0 * self.chord ** 2 * self.dz * r ** 2))
+
     def reset(self) -> None:
         self._prev_un = [np.zeros(self.n_elem), np.zeros(self.n_elem)]
         self._have_prev = False
+        self.air_power = 0.0
