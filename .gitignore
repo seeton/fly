@@ -1,0 +1,18 @@
+# 仮想環境 / キャッシュ
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 巨大な生データと生成物 (再取得・再生成できる)
+data/
+out/
+
+# ローカル固有・ログ
+.claude/settings.local.json
+MUJOCO_LOG.TXT
+
+# 学習済みのパラメータだけは残す (小さい・再学習に時間がかかる)
+!out/
+out/*
+!out/*.json
