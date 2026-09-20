@@ -16,6 +16,7 @@ MuJoCo 内蔵の楕円体流体では「実物の4倍のパワーで6割の揚�
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from flybody_model import load_model  # noqa: E402
 from insect_aero import C_D, C_L, WingAero  # noqa: E402
 
+OUT = Path(__file__).resolve().parent.parent / "out"
 WINGS = ["wing_yaw_left", "wing_roll_left", "wing_pitch_left",
          "wing_yaw_right", "wing_roll_right", "wing_pitch_right"]
 
@@ -88,12 +90,90 @@ def tethered(m, aero, freq=200.0, roll_mean=0.25, roll_amp=1.2,
     return F / W, float(np.mean(pw))
 
 
+def compare_implementations(n_elem: int = 6, steps: int = 20000) -> None:
+    """空力の3実装が同じ力を出すことを確かめ、速度を測る。
+
+    速度は学習で回せる試行数に直結する。翼素は片翼6個しかないので
+    計算量は無いに等しく、費用はほぼ NumPy の呼び出し回数で決まっていた。
+    """
+    import time
+
+    import mujoco
+
+    m, aero = build(n_elem=n_elem)
+    aero.wind = np.array([-8.0, 0.0, 0.0])
+    p = json.loads((OUT / "flight_policy.json").read_text(encoding="utf-8"))["params"]
+    A = {n: m.actuator(n).id for n in WINGS}
+    mid = (p["pitch_down"] + p["pitch_up"]) / 2
+    amp = (p["pitch_down"] - p["pitch_up"]) / 2
+    d = mujoco.MjData(m)
+    d.qpos[2] = 9.0
+    aero.reset()
+    aero.apply(m, d)                                   # numba の初回コンパイル
+
+    print("=== 3実装の一致 ===")
+    print(f"numba: {'使う' if aero._use_kernel else '無し (NumPy で動作)'}")
+    worst_f = worst_m = worst_p = scale = 0.0
+    for s in range(steps):
+        t = s * m.opt.timestep
+        th = 2 * np.pi * p["freq"] * t
+        feather = mid + amp * np.tanh(p["sharp"] * np.sin(th + p["phase"]))
+        dev = p["yaw"] + p["yaw_amp"] * np.cos(th + p["yaw_phase"])
+        for side in ("left", "right"):
+            d.ctrl[A[f"wing_yaw_{side}"]] = np.clip(dev, -1.5, 1.5)
+            d.ctrl[A[f"wing_roll_{side}"]] = np.clip(
+                p["roll_mean"] + p["roll_amp"] * np.cos(th), -1.0, 1.5)
+            d.ctrl[A[f"wing_pitch_{side}"]] = np.clip(feather, -1.27, 2.92)
+        aero.apply(m, d)
+        f1, p1 = d.xfrc_applied.copy(), aero.air_power
+        aero._apply_numpy(m, d)
+        f2, p2 = d.xfrc_applied.copy(), aero.air_power
+        aero._apply_loop(m, d)
+        f3, p3 = d.xfrc_applied.copy(), aero.air_power
+        worst_f = max(worst_f, float(np.abs(f1[:, :3] - f3[:, :3]).max()),
+                      float(np.abs(f2[:, :3] - f3[:, :3]).max()))
+        worst_m = max(worst_m, float(np.abs(f1[:, 3:] - f3[:, 3:]).max()))
+        worst_p = max(worst_p, abs(p1 - p3), abs(p2 - p3))
+        scale = max(scale, float(np.abs(f3).max()))
+        mujoco.mj_step(m, d)
+    print(f"  {steps} ステップで、素の loop 版との最大の差")
+    print(f"    力     {worst_f:.3e}  (力の大きさ {scale:.3e} -> 相対 {worst_f/max(scale,1e-30):.2e})")
+    print(f"    トルク {worst_m:.3e}")
+    print(f"    パワー {worst_p:.3e} erg/s")
+
+    print("\n=== 1 ステップの費用 ===")
+    N = 6000
+    times = {}
+    for nm, fn in (("numba", aero.apply), ("NumPy", aero._apply_numpy),
+                   ("loop ", aero._apply_loop)):
+        t0 = time.perf_counter()
+        for _ in range(N):
+            fn(m, d)
+        times[nm] = (time.perf_counter() - t0) / N
+    t0 = time.perf_counter()
+    for _ in range(N):
+        mujoco.mj_step(m, d)
+    t_step = (time.perf_counter() - t0) / N
+    for nm, v in times.items():
+        print(f"  空力 {nm}  {v*1e6:7.1f} us   (mj_step {t_step*1e6:.1f} us に対し "
+              f"{v/t_step*100:5.1f}%)")
+    print(f"\n  1 秒の飛行 (50000 ステップ) あたり")
+    for nm, v in times.items():
+        print(f"    {nm}: {(v+t_step)*50000:6.1f} s")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--n-elem", type=int, default=6)
+    ap.add_argument("--compare", action="store_true",
+                    help="空力の3実装 (numba / NumPy / 素の loop) の一致と速度を見る")
     args = ap.parse_args()
+
+    if args.compare:
+        compare_implementations(args.n_elem)
+        return
 
     print("=== 力係数の確認 (Dickinson et al. 1999) ===")
     for a in (0, 15, 30, 45, 60, 90):

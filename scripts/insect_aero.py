@@ -38,6 +38,105 @@ def C_D(alpha_deg):
 C_ROT = np.pi * (0.75 - 0.25)
 
 
+# --- 速度の話 ---------------------------------------------------------------
+# 翼素は片翼6個しかないので計算量は無いに等しいが、NumPy は配列1つにつき
+# 数 us の呼び出し費用がかかる。翅ごとに回していた最初の版は 1 ステップ 455 us で、
+# MuJoCo 本体の 187 us を超えて **全体の 7割** を占めていた。
+# 左右をまとめて 257 us、さらに numba で回すと 1 桁下がる。
+# 学習は数千回の試行を回すので、ここの速度がそのまま実験できる回数になる。
+try:
+    from numba import njit as _njit
+    _HAVE_NUMBA = True
+except ImportError:                                  # numba が無くても動く
+    _HAVE_NUMBA = False
+
+    def _njit(*a, **k):
+        def deco(f):
+            return f
+        return deco
+
+
+@_njit(cache=True, fastmath=False)
+def _aero_kernel(n_hat, s_hat, origin, omega, v_lin, wind, xipos,
+                 z, chord, dz, rho, use_rot, F, M, un_out):
+    """翼素ごとの力・トルク・空気へのパワーを積む。NumPy 版と同じ式。
+
+    fastmath は切ってある。順序を変えられると NumPy 版との一致が崩れ、
+    照合 (`16_validate_aero.py --compare`) が意味を失うため。
+    """
+    power = 0.0
+    n_w = n_hat.shape[0]
+    n_e = z.shape[0]
+    for w in range(n_w):
+        nx, ny, nz_ = n_hat[w, 0], n_hat[w, 1], n_hat[w, 2]
+        sx, sy, sz_ = s_hat[w, 0], s_hat[w, 1], s_hat[w, 2]
+        ox, oy, oz = omega[w, 0], omega[w, 1], omega[w, 2]
+        omega_rot = ox * sx + oy * sy + oz * sz_
+        for i in range(n_e):
+            rx, ry, rz = z[i] * sx, z[i] * sy, z[i] * sz_
+            # v = v_lin + omega x r - wind
+            vx = v_lin[w, 0] + (oy * rz - oz * ry) - wind[0]
+            vy = v_lin[w, 1] + (oz * rx - ox * rz) - wind[1]
+            vz = v_lin[w, 2] + (ox * ry - oy * rx) - wind[2]
+            # スパン方向成分を落とす
+            vs = vx * sx + vy * sy + vz * sz_
+            ux, uy, uz = vx - vs * sx, vy - vs * sy, vz - vs * sz_
+            U = np.sqrt(ux * ux + uy * uy + uz * uz)
+            ok = U > 1e-9
+            Us = U if ok else 1.0
+            if ok:
+                hx, hy, hz = ux / Us, uy / Us, uz / Us
+            else:
+                hx = hy = hz = 0.0
+            un = ux * nx + uy * ny + uz * nz_
+            un_out[w, i] = un
+            sin_a = abs(un) / Us
+            if sin_a > 1.0:
+                sin_a = 1.0
+            alpha = np.degrees(np.arcsin(sin_a))
+            cl = 0.225 + 1.58 * np.sin(np.radians(2.13 * alpha - 7.2))
+            cd = 1.92 - 1.55 * np.cos(np.radians(2.04 * alpha - 9.82))
+            if cd < 0.0:
+                cd = 0.0
+            q = 0.5 * rho * chord[i] * dz * U * U
+            # 抗力
+            fx, fy, fz = -(cd * q) * hx, -(cd * q) * hy, -(cd * q) * hz
+            # 揚力: 流入に直交し、流れが当たっている面から離れる向き
+            if un > 0.0:
+                sgn = -1.0
+            elif un < 0.0:
+                sgn = 1.0
+            else:
+                sgn = 0.0
+            ex, ey, ez = sgn * nx, sgn * ny, sgn * nz_
+            proj = ex * hx + ey * hy + ez * hz
+            lx, ly, lz = ex - proj * hx, ey - proj * hy, ez - proj * hz
+            ln = np.sqrt(lx * lx + ly * ly + lz * lz)
+            if ln > 1e-9:
+                lx, ly, lz = lx / ln, ly / ln, lz / ln
+            fx += (cl * q) * lx
+            fy += (cl * q) * ly
+            fz += (cl * q) * lz
+            # 回転揚力
+            if use_rot:
+                fr = C_ROT * rho * omega_rot * U * chord[i] * chord[i] * dz
+                fx += fr * nx
+                fy += fr * ny
+                fz += fr * nz_
+            F[w, 0] += fx
+            F[w, 1] += fy
+            F[w, 2] += fz
+            # トルクは body の重心まわり
+            ax = origin[w, 0] + rx - xipos[w, 0]
+            ay = origin[w, 1] + ry - xipos[w, 1]
+            az = origin[w, 2] + rz - xipos[w, 2]
+            M[w, 0] += ay * fz - az * fy
+            M[w, 1] += az * fx - ax * fz
+            M[w, 2] += ax * fy - ay * fx
+            power -= fx * vx + fy * vy + fz * vz
+    return power
+
+
 class WingAero:
     """両翅に翼素理論の力を与える。
 
@@ -68,10 +167,23 @@ class WingAero:
 
         self.rho = rho
         self.n_elem = n_elem
+        # 風 [cm/s]。翅にあたる空気の速度は「翅の速度 - 風」になる。
+        # 匂いを運ぶ風がハエ自身を流さないのは都合が良すぎるので、
+        # 空力の側にもちゃんと入れる。
+        self.wind = np.zeros(3)
         self.use_rot = use_rotational
         self.use_am = use_added_mass
         self.gids = [model.geom(g).id for g in self.GEOMS]
         self.bids = [model.geom_bodyid[g] for g in self.gids]
+        # 左右まとめて配列で扱うための添字 (apply 参照)
+        self._gid_arr = np.asarray(self.gids)
+        self._bid_arr = np.asarray(self.bids)
+        if len(set(self.bids)) != len(self.bids):
+            raise ValueError("左右の翅が同じ body に乗っている。apply の加算が壊れる")
+        self._vel = np.zeros((len(self.gids), 6))
+        self._F = np.zeros((len(self.gids), 3))
+        self._M = np.zeros((len(self.gids), 3))
+        self._use_kernel = _HAVE_NUMBA
 
         # 楕円体の半軸: (法線方向, 翅弦方向, スパン方向)
         size = model.geom_size[self.gids[0]]
@@ -86,6 +198,7 @@ class WingAero:
             np.clip(1.0 - (self.z / self.half_span) ** 2, 0.0, 1.0))
 
         self._prev_un = [np.zeros(n_elem), np.zeros(n_elem)]
+        self._prev_un_arr = np.zeros((len(self.gids), n_elem))
         self._have_prev = False
         self._mj = mujoco
         # 翅が空気に渡したパワー [erg/s]。定常飛行では必ず正。
@@ -129,7 +242,117 @@ class WingAero:
         model.opt.wind[:] = 0.0
 
     def apply(self, model, data, dt: float | None = None) -> None:
-        """今の状態から空気力を計算し、data.xfrc_applied に入れる。"""
+        """今の状態から空気力を計算し、data.xfrc_applied に入れる。
+
+        実装は3つあり、結果はどれも一致する
+        (`16_validate_aero.py --compare` で照合):
+
+            apply          numba カーネル。既定
+            _apply_numpy   左右をまとめた NumPy 版 (numba が無ければこちら)
+            _apply_loop    翅ごとに回す最初の版。読みやすさ優先で残してある
+
+        付加質量を使うとき (`use_added_mass=True`) は NumPy 版に回す。
+        """
+        if self.use_am or not self._use_kernel:
+            return self._apply_numpy(model, data, dt)
+
+        mujoco = self._mj
+        data.xfrc_applied[:] = 0.0
+        gids, bids = self._gid_arr, self._bid_arr
+        R = data.geom_xmat[gids].reshape(-1, 3, 3)
+        n_hat = np.ascontiguousarray(R[:, :, 0])      # 翅面の法線
+        s_hat = np.ascontiguousarray(R[:, :, 2])      # スパン方向
+        vel = self._vel
+        for k, gid in enumerate(self.gids):
+            mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_GEOM,
+                                     gid, vel[k], 0)
+        F, M = self._F, self._M
+        F[:] = 0.0
+        M[:] = 0.0
+        self.air_power = _aero_kernel(
+            n_hat, s_hat, data.geom_xpos[gids],
+            np.ascontiguousarray(vel[:, :3]), np.ascontiguousarray(vel[:, 3:]),
+            self.wind, data.xipos[bids], self.z, self.chord, self.dz,
+            self.rho, self.use_rot, F, M, self._prev_un_arr)
+        data.xfrc_applied[bids, 0:3] += F
+        data.xfrc_applied[bids, 3:6] += M
+        self._have_prev = True
+
+    def _apply_numpy(self, model, data, dt: float | None = None) -> None:
+        """左右の翅をまとめて (2, n_elem) の配列で扱う NumPy 版。"""
+        mujoco = self._mj
+        dt = model.opt.timestep if dt is None else dt
+        data.xfrc_applied[:] = 0.0
+
+        gids, bids = self._gid_arr, self._bid_arr
+        R = data.geom_xmat[gids].reshape(-1, 3, 3)
+        n_hat, s_hat = R[:, :, 0], R[:, :, 2]        # 法線 / スパン方向
+        origin = data.geom_xpos[gids]                # (2,3)
+
+        vel = self._vel
+        for k, gid in enumerate(self.gids):
+            mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_GEOM,
+                                     gid, vel[k], 0)
+        omega, v_lin = vel[:, :3], vel[:, 3:]
+
+        z = self.z[None, :, None]                    # (1,N,1)
+        r = z * s_hat[:, None, :]                    # ヒンジからの腕 (2,N,3)
+        pts = origin[:, None, :] + r
+        v = v_lin[:, None, :] + np.cross(omega[:, None, :], r) - self.wind
+
+        # スパン方向成分を除いた流入速度 (翼素理論はスパン流を無視)
+        u = v - np.einsum("wnc,wc->wn", v, s_hat)[..., None] * s_hat[:, None, :]
+        U = np.sqrt(np.einsum("wnc,wnc->wn", u, u))
+        ok = U > 1e-9
+        Us = np.where(ok, U, 1.0)
+        u_hat = np.where(ok[..., None], u / Us[..., None], 0.0)
+
+        # 迎角: 流入と翅面のなす角 (0-90 deg)
+        un = np.einsum("wnc,wc->wn", u, n_hat)
+        alpha = np.degrees(np.arcsin(np.clip(np.abs(un) / Us, 0.0, 1.0)))
+
+        cl = C_L(alpha)
+        cd = np.maximum(C_D(alpha), 0.0)
+        q = 0.5 * self.rho * self.chord[None, :] * self.dz * U * U
+
+        dF = -(cd * q)[..., None] * u_hat            # 抗力は流入と逆向き
+
+        # 揚力は流入に直交し、流れが当たっている面から離れる向き
+        n_eff = np.sign(-un)[..., None] * n_hat[:, None, :]
+        lift_dir = n_eff - np.einsum("wnc,wnc->wn", n_eff, u_hat)[..., None] * u_hat
+        ln = np.sqrt(np.einsum("wnc,wnc->wn", lift_dir, lift_dir))
+        lift_dir = np.where((ln > 1e-9)[..., None], lift_dir / np.where(ln > 1e-9, ln, 1.0)[..., None],
+                            lift_dir)
+        dF += (cl * q)[..., None] * lift_dir
+
+        # 回転揚力 (打ち返しで翅がスパン軸まわりに回ることで出る)
+        if self.use_rot:
+            omega_rot = np.einsum("wc,wc->w", omega, s_hat)[:, None]
+            dF_rot = (C_ROT * self.rho * omega_rot * U *
+                      self.chord[None, :] ** 2 * self.dz)
+            dF += dF_rot[..., None] * n_hat[:, None, :]
+
+        # 付加質量 (翅が押しのける空気の慣性)。既定では使わない (__init__ 参照)
+        if self.use_am:
+            if self._have_prev:
+                dun = (un - self._prev_un_arr) / dt
+                dF += (self.rho * np.pi / 4.0 * self.chord[None, :] ** 2 *
+                       self.dz * dun)[..., None] * n_hat[:, None, :]
+            self._prev_un_arr = un.copy()
+
+        F = dF.sum(axis=1)                            # (2,3)
+        arm = pts - data.xipos[bids][:, None, :]      # トルクは body 重心まわり
+        M = np.cross(arm, dF).sum(axis=1)
+        # 左右の翅は別 body なので添字は重複しない (__init__ で確認済み)
+        data.xfrc_applied[bids, 0:3] += F
+        data.xfrc_applied[bids, 3:6] += M
+
+        # 空気が翅にした仕事率の符号を反転 = 翅が空気に渡したパワー
+        self.air_power = -float(np.einsum("wnc,wnc->", dF, v))
+        self._have_prev = True
+
+    def _apply_loop(self, model, data, dt: float | None = None) -> None:
+        """翅ごとに回す素直な実装。`apply` の結果を照合するために残してある。"""
         mujoco = self._mj
         dt = model.opt.timestep if dt is None else dt
         data.xfrc_applied[:] = 0.0
@@ -151,7 +374,7 @@ class WingAero:
             # 各翼素の位置と速度
             pts = origin[None, :] + self.z[:, None] * s_hat[None, :]
             r = pts - origin[None, :]
-            v = v_lin[None, :] + np.cross(omega[None, :], r)
+            v = v_lin[None, :] + np.cross(omega[None, :], r) - self.wind[None, :]
 
             # スパン方向成分を除いた流入速度 (翼素理論はスパン流を無視)
             v_span = (v @ s_hat)[:, None] * s_hat[None, :]
@@ -232,5 +455,6 @@ class WingAero:
 
     def reset(self) -> None:
         self._prev_un = [np.zeros(self.n_elem), np.zeros(self.n_elem)]
+        self._prev_un_arr = np.zeros((len(self.gids), self.n_elem))
         self._have_prev = False
         self.air_power = 0.0
