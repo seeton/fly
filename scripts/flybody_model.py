@@ -125,7 +125,9 @@ WING_JOINTS = ["wing_roll_left", "wing_yaw_left", "wing_pitch_left",
 def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
                aero: bool = True, add_floor: bool = True,
                wing_armature: float | None = WING_INERTIA,
-               wing_damping: float | None = 1e-5):
+               wing_damping: float | None = 1e-5,
+               scene: bool = False, scene_seed: int = 0,
+               two_flowers: bool = False):
     """翅つきモデルを組み立てて返す。翅は位置サーボ化してある。
 
     wing_armature:
@@ -165,12 +167,43 @@ def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
             if mesh.name in dropped:
                 mesh.delete()
 
-    if add_floor:
+    # 前向きのカメラを胸部に足す。
+    # 同梱の eye_left / eye_right は視野140度だが強く側方を向いていて、
+    # 正面にある的 (花) がほとんど写らない。実物のハエも前方に両眼視の
+    # 重なりを持つので、そこを見るカメラを1つ用意する。
+    # MuJoCo のカメラは -z 方向を見るので、-z を機体の +x に向ける。
+    import numpy as _np
+    _R = _np.array([[0.0, 0.0, -1.0],
+                    [-1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0]])
+    _q = _np.zeros(4)
+    mujoco.mju_mat2Quat(_q, _R.flatten())
+    for _body in spec.bodies:
+        if _body.name == "thorax":
+            _c = _body.add_camera()
+            _c.name = "eye_front"
+            _c.pos = [0.06, 0.0, 0.0]
+            _c.fovy = 120.0
+            _c.quat = _q
+            break
+
+    if scene:
+        from world_scene import add_scene
+        add_scene(spec, seed=scene_seed, two_flowers=two_flowers)
+    elif add_floor:
         spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
                                 size=[0, 0, 0.1], pos=[0, 0, 0],
                                 rgba=[0.16, 0.17, 0.19, 1])
 
     model = spec.compile()
+
+    # 近クリップ面を詰める。
+    # MuJoCo の近クリップは znear x (モデルの extent) で決まる。地面が 400cm
+    # あるため extent が 1475 cm になり、既定の znear=0.01 では **14.75 cm**。
+    # ハエの体長は 0.25 cm、目の前の草や花は 1-3 cm なので、それが全部
+    # 切り取られて見えていなかった。複眼を使うならここを詰める必要がある。
+    model.vis.map.znear = 1e-4        # -> 約 0.15 cm
+    model.vis.map.zfar = 20.0
 
     if aero:
         for i in range(model.ngeom):

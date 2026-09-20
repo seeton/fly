@@ -69,6 +69,15 @@ NAMES = [p[0] for p in PARAMS]
 
 _MODEL = None
 _AERO = None
+_LEG_TARGETS = None
+
+
+def _has_actuator(model, name):
+    try:
+        model.actuator(name)
+        return True
+    except Exception:
+        return False
 
 
 def get_aero():
@@ -167,9 +176,19 @@ def rollout(x, target=(0.0, 0.0, 10.0), seconds=0.5, z0=10.0, record=False):
     aero.reset()
     p = decode(x)
     A = {n: m.actuator(n).id for n in WINGS}
+    # 実物のハエは飛ぶとき脚をたたむ。指令を 0 のままにすると脚を広げた
+    # 着地姿勢で飛ぶことになり、余計な抗力で揚力が約10%落ちる。
+    from flight_posture import leg_targets
+    global _LEG_TARGETS
+    if _LEG_TARGETS is None:
+        _LEG_TARGETS = {m.actuator(k).id: v for k, v in leg_targets(m).items()
+                        if _has_actuator(m, k)}
     body_id = m.body("thorax").id
     d = mujoco.MjData(m)
     d.qpos[2] = z0
+    for aid, val in _LEG_TARGETS.items():
+        d.ctrl[aid] = val
+        d.qpos[m.jnt_qposadr[m.actuator_trnid[aid, 0]]] = val
     tx, ty, tz = target
 
     mid = (p["pitch_down"] + p["pitch_up"]) / 2
