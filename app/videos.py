@@ -96,6 +96,12 @@ CATALOG: tuple[Clip, ...] = (
          "シミュレーションの入力で光る — 視葉は複眼に映った像、脚の神経核は関節の"
          "動き。入力を作っていない領域は暗いまま。",
          ("scripts/23_synapse_movie.py",), "回路から体へ"),
+    Clip("forage_brain.mp4", "花に近づく脳 — 匂いと好み",
+         "見た目が同じ2つの花 (匂いだけ違う) に近づく。触角葉は左右の触角に届いた"
+         "匂いで、外側角は好む匂いがどれだけ優勢かで光る。おとりのプルームに"
+         "迷い込むと外側角が消え、抜けると戻る。**キノコ体は暗いまま** — そこは"
+         "学習した価値を扱う場所で、このシミュレーションは何も学習していない。",
+         ("scripts/25_forage_brain.py",), "回路から体へ"),
     Clip("escape_takeoff.mp4", "跳躍 — 回路が指した動作を体にやらせる",
          "DNp01 発火 → TTMn → 中脚の転節-腿節関節を伸展。中脚だけの方が後脚も"
          "一緒に蹴るより高く跳ぶ (TTM が中脚の筋肉だという解剖と一致する)。",
@@ -164,6 +170,22 @@ class ClipState:
 LOGS = OUT / "logs"
 
 
+def read_log(p: Path) -> str:
+    """ログを読む。**文字コードで転んでもアプリを落とさない**。
+
+    Windows のコンソールに素直にリダイレクトすると CP932 で書かれる
+    (`PYTHONIOENCODING=utf-8` を付け忘れた場合)。out/logs は手で置くことも
+    あるので、utf-8 → cp932 → 置き換え、の順で読む。
+    """
+    raw = p.read_bytes()
+    for enc in ("utf-8", "cp932"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def log_path(name: str) -> Path:
     """動画名に対応する実行ログの置き場。"""
     return LOGS / f"{Path(name).stem}.txt"
@@ -197,9 +219,9 @@ def scan() -> list[ClipState]:
         lp = log_path(clip.name)
         if lp.exists():
             try:
-                st.log = lp.read_text(encoding="utf-8")
-            except OSError:
-                pass
+                st.log = read_log(lp)
+            except Exception:
+                pass      # ログが読めないだけで一覧を止めない
         states.append(st)
     return states
 

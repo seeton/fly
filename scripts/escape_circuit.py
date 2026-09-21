@@ -349,7 +349,8 @@ class BrainPanel:
             self.cloud = np.zeros((0, 3))
             self.cloud_roi = np.zeros(0, dtype=str)
         self._optic = None
-        self._leg = None
+        self._regions = None
+        self._mask_cache: dict = {}
         self._map_retinotopy(n_omma)
 
         # --- 描画の準備 ---
@@ -511,6 +512,15 @@ class BrainPanel:
         t = np.asarray(times, dtype=float)
         ph = np.asarray(photo, dtype=np.float32).reshape(len(t), 2, -1)
         mo = np.asarray(motion, dtype=np.float32).reshape(len(t), 2, -1)
+        # 個眼の数が retinotopy を張ったときと違うと、添字が黙って別の
+        # 個眼を指す (落ちない。絵が静かに嘘になる)。複眼の視野や個眼間角を
+        # いじると n_omma が変わるので、ここで必ず突き合わせる
+        if ph.shape[2] != self.n_omma ** 2:
+            raise ValueError(
+                f"個眼の数が合わない: 入力は 1眼 {ph.shape[2]} 個 "
+                f"({int(round(ph.shape[2] ** 0.5))}x)、"
+                f"retinotopy は {self.n_omma}x{self.n_omma}。"
+                f"BrainPanel(..., n_omma=eyes.n_omma) を渡すこと")
         p_hi = max(float(np.percentile(ph, 99.0)), 1e-9)
         m_hi = max(float(np.percentile(mo, 99.5)), 1e-9)
         b = (w_lum * np.clip(ph / p_hi, 0.0, 1.0)
@@ -519,23 +529,85 @@ class BrainPanel:
         print(f"視葉の入力: {len(t)} 時刻 x 2 眼 x {ph.shape[2]} 個眼。"
               f"明るさの 99% 点 {p_hi:.3f} / 動きの 99.5% 点 {m_hi:.4f}")
 
+    def region_mask(self, key: str) -> np.ndarray:
+        """領域名にあたる点の添字。
+
+        `AL` のように頭だけ書けば左右とも、`AL(L)` と書けばその側だけ、
+        `LegNp(T2)(R)` のように最後まで書けばその脚だけに当たる。
+        """
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+        roi = np.asarray([str(r) for r in self.cloud_roi])
+        idx = np.nonzero((roi == key) | np.char.startswith(roi, key + "("))[0]
+        self._mask_cache[key] = idx
+        return idx
+
+    def region_level(self, key: str) -> float:
+        """直前に描いた絵での、その領域の明るさの平均 0..1。
+
+        領域によっては点が小さく散っていて (外側角は 45,000 点中 810 点)、
+        3D の絵だけでは光っているかどうかが読み取れない。同じ数字を
+        文字でも出せるようにしておく。
+        """
+        cb = getattr(self, "cloud_b", None)
+        if cb is None or not len(cb):
+            return 0.0
+        idx = self.region_mask(key)
+        return float(cb[idx].mean()) if len(idx) else 0.0
+
+    def attach_region_drive(self, times, series: dict, scale=None,
+                            gamma: float = 0.6, label: str = "領域") -> None:
+        """領域ごとの1本の信号で、その領域の点をまとめて光らせる。
+
+        個眼の格子のような場所の対応が無い領域 — 触角葉に届く匂いの濃度、
+        脚や翅の神経核に届く関節の動き — はこちらで配る。領域の中の
+        どこが光るかは分からないので、領域まるごとを同じ明るさにする。
+
+        series  {"AL(L)": (n_t,), "LH": (n_t,), ...}。キーは領域名。
+        scale   表示のための割り算。数値1つなら全キーに同じ値、辞書なら
+                キーごと、省略するとキーごとの 99 パーセンタイル。
+                **ここだけが見せ方の都合** で、信号そのものは呼ぶ側が作る。
+                同じ物理量の領域どうし (脚の6群など) は数値1つを渡して
+                共通の物差しにしないと、動いていない脚まで明るくなる。
+        """
+        t = np.asarray(times, dtype=float)
+        if self._regions is None:
+            self._regions = (t, [])
+        out = self._regions[1]
+        for key, arr in series.items():
+            idx = self.region_mask(key)
+            if not len(idx):
+                continue
+            v = np.asarray(arr, dtype=float)
+            if isinstance(scale, dict):
+                hi = scale.get(key)
+            else:
+                hi = scale
+            if hi is None:
+                hi = float(np.percentile(np.abs(v), 99.0))
+            hi = max(float(hi), 1e-12)
+            out.append((idx, np.clip(np.abs(v) / hi, 0.0, 1.0) ** gamma))
+            print(f"{label}の入力: {key:14s} {len(idx):5,} 点  物差し {hi:.4g}")
+
     def attach_leg_drive(self, times, speed: dict, gamma: float = 0.6) -> None:
         """脚の関節が動いた速さを、対応する脚神経核に配る (固有受容の入力)。
 
-        speed は {"T2_right": (n_t,) [rad/s], ...}。99 パーセンタイルで
-        正規化する。立っているあいだは中央値 0 rad/s (脚の制御が落ち着いて
-        いる) なので暗く、跳ぶ瞬間に光る。95 パーセンタイルだと 0.25 rad/s と
-        跳躍の立ち上がりで決まってしまい、跳んでいる間じゅう振り切れて
-        中脚と前脚と後脚の区別が消える。
+        speed は {"T2_right": (n_t,) [rad/s], ...}。6群に共通の物差しとして
+        99 パーセンタイルを使う。立っているあいだは中央値 0 rad/s (脚の制御が
+        落ち着いている) なので暗く、跳ぶ瞬間に光る。95 パーセンタイルだと
+        0.25 rad/s と跳躍の立ち上がりで決まってしまい、跳んでいる間じゅう
+        振り切れて中脚と前脚と後脚の区別が消える。
         """
-        if not self.leg_names or not speed:
+        if not speed:
             return
-        t = np.asarray(times, dtype=float)
-        v = np.stack([np.asarray(speed.get(k, np.zeros(len(t))), dtype=float)
-                      for k in self.leg_names], axis=1)
+        v = np.stack([np.asarray(a, dtype=float) for a in speed.values()], axis=1)
         hi = max(float(np.percentile(v, 99.0)), 1e-9)
-        self._leg = (t, np.clip(v / hi, 0.0, 1.0) ** gamma)
-        print(f"脚神経核の入力: {v.shape[1]} 群。関節速度の 99% 点 {hi:.2f} rad/s")
+        series = {}
+        for k, arr in speed.items():
+            seg, side = k.split("_")
+            series[f"LegNp({seg})({'L' if side == 'left' else 'R'})"] = arr
+        self.attach_region_drive(times, series, scale=hi, gamma=gamma,
+                                 label="脚神経核")
 
     @staticmethod
     def _lerp(times: np.ndarray, arr: np.ndarray, t: float) -> np.ndarray:
@@ -557,10 +629,11 @@ class BrainPanel:
             m = self.kind == "optic"
             a = self._lerp(self._optic[0], self._optic[1], t)   # (2, n*n)
             b[m] = a[self.optic_eye[m], self.optic_idx[m]]
-        if self._leg is not None:
-            m = self.leg_group >= 0
-            v = self._lerp(self._leg[0], self._leg[1], t)       # (n_group,)
-            b[m] = v[self.leg_group[m]]
+        if self._regions is not None:
+            times, parts = self._regions
+            for idx, vals in parts:
+                v = self._lerp(times, vals, t)                  # スカラー1つ
+                b[idx] = np.maximum(b[idx], float(v))
         return b
 
     def frame(self, t: float, spin_frac: float = 0.0) -> tuple[np.ndarray, int, int]:
@@ -595,6 +668,7 @@ class BrainPanel:
 
         if self.cloud_scat is not None:
             cb = self._cloud_brightness(t)
+            self.cloud_b = cb          # region_level() が読む
             cc = np.empty((len(self.cloud), 4))
             base = np.array(matplotlib.colors.to_rgb(CLOUD_DIM))
             live = np.array(matplotlib.colors.to_rgb(CLOUD_COL))
