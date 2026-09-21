@@ -49,11 +49,15 @@ EYES = ("eye_left", "eye_right")
 FRONT = "eye_front"
 
 # --- 実測値 (Drosophila melanogaster) ---
-FOV_DEG = 140.0     # flybody の eye_left / eye_right の視野
+# 片眼の視野。実物のショウジョウバエは片眼で約180度を見ていて、左右で
+# ほぼ全周をおおう。flybody 同梱のカメラは 140 度なので、読み込み時に広げる。
+# 透視投影では 180 度は作れない (tan が発散する) ので 170 度 = ±85 度が実際の上限。
+FOV_DEG = 170.0
 DPHI_DEG = 5.0      # 個眼間角 (前方でおよそ 4.5-5.7 度)
 DRHO_DEG = 5.1      # 受容角 FWHM (およそ 4.5-5.5 度)
 TAU_PHOTO = 0.008   # 光受容器 + LMC の低域通過
 TAU_EMD = 0.035     # 相関型検出器の遅延フィルタ (20-50 ms)
+TAU_ADAPT = 0.25    # 光順応の時定数 (背景光への追随、50-500 ms)
 
 
 def acceptance_matrix(res: int, fov_deg: float = FOV_DEG,
@@ -78,18 +82,19 @@ def acceptance_matrix(res: int, fov_deg: float = FOV_DEG,
 class FlyEyes:
     """複眼の像 (個眼解像度) と、相関型検出器の出力。
 
-    oversample: 個眼1つあたり何画素で描くか。透視投影では中央の画素が
-        いちばん角度的に粗いので、**中央で受容角を表現できる**ところまで
-        上げる必要がある。既定の 9 (= 252画素) で中央 1.25 度/画素、
-        受容角 5.1 度に対して約4画素ぶん。3 では中央 3.75 度/画素になり、
-        ガウス型の受容野が1画素に潰れて意味をなさない。
-        描画コストはほぼ変わらないので上げても損しない。
+    視野は片眼 170 度 (実物は約180度)。34x34 = 1,156 個眼/眼。
+    実物は約750個なので少し多いが、正方格子なので視野の四隅が実物より
+    広く取れているぶん。六角格子と眼の曲面は再現していない。
+
+    oversample: 個眼1つあたり何画素で描くか。None (既定) なら視野の中央での
+        角度刻みが受容角の 1/4 になるように自動で決める (170度なら1024画素)。
     """
 
     def __init__(self, model, rate_hz: float = 200.0,
                  dphi_deg: float = DPHI_DEG, drho_deg: float = DRHO_DEG,
                  tau_photo: float = TAU_PHOTO, tau_emd: float = TAU_EMD,
-                 oversample: int = 9, fov_deg: float = FOV_DEG,
+                 tau_adapt: float = TAU_ADAPT,
+                 oversample: int | None = None, fov_deg: float = FOV_DEG,
                  res: int | None = None, normalize: bool = True,
                  spectral: bool = True):
         import mujoco
@@ -100,11 +105,29 @@ class FlyEyes:
         # 切ると人間のカメラの RGB のまま扱うことになる
         self.spectral = spectral
         self.n_omma = int(np.floor(fov_deg / dphi_deg))
-        self.res = int(res if res is not None else self.n_omma * oversample)
+        # 描画の解像度は **視野の中央での角度刻み** から決める。
+        # 透視投影では中央がいちばん角度的に粗く、そこで受容角 (5.1度) を
+        # 表現できないとガウス型の受容野が1画素に潰れる。受容角の 1/4 を狙う。
+        # 描画コストは解像度にほぼ依存しない (実測 252px 157ms / 1024px 167ms、
+        # シーン構築が支配的) ので上げても損しない。
+        if res is not None:
+            self.res = int(res)
+        elif oversample is not None and fov_deg <= 145.0:
+            self.res = int(self.n_omma * oversample)     # 旧来の決め方
+        else:
+            span = np.degrees(2.0 * np.tan(np.radians(fov_deg) / 2.0))
+            self.res = int(np.clip(np.ceil(span / (drho_deg / 4.0)), 252, 1400))
         self.M = acceptance_matrix(self.res, fov_deg, dphi_deg, drho_deg)
         self.dt_vis = 1.0 / rate_hz
         self.tau_photo = tau_photo
         self.tau_emd = tau_emd
+        self.tau_adapt = tau_adapt
+        # 同梱カメラの視野を実物寄りに広げる。fruitfly.xml の既定は 140 度。
+        for _name in EYES:
+            try:
+                model.cam_fovy[model.camera(_name).id] = fov_deg
+            except Exception:
+                pass
         model.vis.global_.offwidth = max(model.vis.global_.offwidth, self.res)
         model.vis.global_.offheight = max(model.vis.global_.offheight, self.res)
         self.renderer = mujoco.Renderer(model, height=self.res, width=self.res,
@@ -150,6 +173,7 @@ class FlyEyes:
         self.emd = np.zeros(2)          # 左右それぞれの動き検出器出力
         self.frames = [np.zeros((n, n)), np.zeros((n, n))]
         self.activity = [np.zeros((n, n)), np.zeros((n, n))]
+        self.bg = [None, None]          # 順応の背景光 (side_by_side が使う)
         self.target_x = np.zeros(2)
         self.target_size = np.zeros(2)
         self.front_x = 0.0
@@ -221,11 +245,16 @@ class FlyEyes:
         self._use_fly_colors(model, True)
         a_p = 1.0 - np.exp(-dt / self.tau_photo)
         a_d = 1.0 - np.exp(-dt / self.tau_emd)
+        a_bg = 1.0 - np.exp(-dt / self.tau_adapt)
 
         for i, cam in enumerate(EYES):
             lum = self._grab(model, data, cam)
             om = self._ommatidia(lum)
             self.frames[i] = om
+            # 光順応。背景光にゆっくり追随する (実物の光受容器も同じことをする)
+            mean = float(om.mean())
+            self.bg[i] = mean if self.bg[i] is None else \
+                self.bg[i] + a_bg * (mean - self.bg[i])
 
             mask = self._target_mask(self._rgb)
             n_hit = int(mask.sum())
@@ -299,15 +328,36 @@ class FlyEyes:
             return 0.0
         return float(self.front_x)
 
-    def side_by_side(self, scale: int = 1) -> np.ndarray:
+    def side_by_side(self, scale: int = 1, adapt: bool = True) -> np.ndarray:
         """左右の個眼の像を並べた画像 (uint8, 動画への貼り込み用)。
 
         ここに出るのが **ハエが実際に解像できる像**。粗くてボケている。
+
+        以前はフレームごとに最小・最大で 0-1 に引き伸ばしていた。あれは
+        表示のたびにコントラストを作り直すので、**画面の明暗差が実際の
+        明暗差と関係なくなる**。暗い場面でも派手に見えてしまい、
+        「ハエの視界はこんなに騒がしいのか」という誤った印象を与えていた。
+
+        かわりに光受容器の順応を入れる。応答は Naka-Rushton 型
+
+            R = I / (I + sigma)
+
+        で、sigma は背景光にゆっくり追随する (時定数 tau_adapt)。
+        背景と同じ明るさなら R = 0.5、真っ暗で 0、背景よりずっと明るいと 1 に
+        近づく。実物の光受容器がやっているのもこれで、**場面ごとに勝手な
+        引き伸ばしをするのとは別物**。順応の効き方も含めて画面に出る。
+
+        adapt=False にすると順応を切り、励起をそのまま出す (比較用)。
         """
-        img = np.concatenate([self.frames[0], self.frames[1]], axis=1)
-        lo, hi = float(img.min()), float(img.max())
-        if hi - lo > 1e-6:
-            img = (img - lo) / (hi - lo)
+        out = []
+        for i in range(2):
+            om = self.frames[i]
+            if not adapt:
+                out.append(np.clip(om, 0.0, 1.0))
+                continue
+            bg = self.bg[i] if self.bg[i] is not None else max(float(om.mean()), 1e-6)
+            out.append(om / (om + bg + 1e-6))
+        img = np.concatenate(out, axis=1)
         img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
         if scale > 1:
             img = np.repeat(np.repeat(img, scale, axis=0), scale, axis=1)

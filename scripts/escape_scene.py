@@ -36,7 +36,7 @@ LEG_SEGMENTS = ("T1", "T2", "T3")
 LEG_SIDES = ("left", "right")
 
 
-def add_arena(spec, start_xyz, seed: int = 3):
+def add_arena(spec, start_xyz, seed: int = 3, shape: str = "swatter"):
     """明るく開けた地面と空、遠くの低い草、そして迫ってくる黒い球。
 
     最初は `world_scene` の草むらをそのまま使ったが、地面に立ったハエ
@@ -108,25 +108,63 @@ def add_arena(spec, start_xyz, seed: int = 3):
         gg.material = "arena_green%d" % (i % len(greens))
         gg.contype = gg.conaffinity = 0
     _cameras(spec, close=True)
-    add_predator(spec, start_xyz)
+    add_predator(spec, start_xyz, shape)
 
 
-def add_predator(spec, start_xyz):
-    """迫ってくる暗い球を足す。mocap なので位置を直接指定して動かせる。"""
+def add_predator(spec, start_xyz, shape: str = "swatter"):
+    """迫ってくるものを足す。mocap なので位置を直接指定して動かせる。
+
+    最初はただの黒い球だった。ハエ側が使う情報は「黒い塊の視角が広がる速さ」
+    だけなので機能的には足りるが、**見た目に意味が無く、何が迫っているのか
+    分からない絵**になっていた。
+
+    shape:
+        "swatter" (既定) … 叩こうとする平たい面と柄。ハエが実際に逃げる相手で、
+            見れば何が起きているか分かる。視角を決めるのは面の直径なので、
+            正面から来るかぎり球と同じ大きさに見える (比較が保てる)。
+        "disc" … 実験室の標準刺激そのもの。画面に出す暗い円盤。
+        "sphere" … 以前の版。比較用に残す。
+
+    どれも複眼から見えるように group 0 に置き、当たり判定は持たせない
+    (ぶつける実験ではないので)。
+    """
     import mujoco
 
     b = spec.worldbody.add_body()
     b.name = "predator"
     b.mocap = True
     b.pos = list(start_xyz)
-    g = b.add_geom()
-    g.name = "predator_geom"
-    g.type = mujoco.mjtGeom.mjGEOM_SPHERE
-    g.size = [PRED_R, 0.0, 0.0]
-    g.rgba = [0.03, 0.03, 0.04, 1.0]
-    g.group = 0                     # 複眼は group 0 しか描かないので 0 に置く
-    g.contype = 0
-    g.conaffinity = 0
+    dark = [0.05, 0.05, 0.06, 1.0]
+
+    def _geom(name, gtype, size, pos, quat=None, rgba=dark):
+        g = b.add_geom()
+        g.name = name
+        g.type = gtype
+        g.size = list(size)
+        g.pos = list(pos)
+        if quat is not None:
+            g.quat = list(quat)
+        g.rgba = list(rgba)
+        g.group = 0
+        g.contype = 0
+        g.conaffinity = 0
+        return g
+
+    if shape == "sphere":
+        _geom("predator_geom", mujoco.mjtGeom.mjGEOM_SPHERE, [PRED_R, 0, 0], [0, 0, 0])
+        return
+
+    # 面はハエのほうを向く。捕食者は -x 方向へ進むので、面の法線を x 軸に
+    # 合わせる。円柱の軸は既定で z なので y 軸まわりに 90 度回す。
+    q_face = [np.cos(np.pi / 4), 0.0, np.sin(np.pi / 4), 0.0]
+    _geom("predator_geom", mujoco.mjtGeom.mjGEOM_CYLINDER,
+          [PRED_R, 0.06, 0.0], [0, 0, 0], q_face)
+    if shape == "swatter":
+        # 柄。斜め後ろ上へ伸ばす。視角には効かないが「叩かれる」と分かる
+        _geom("predator_handle", mujoco.mjtGeom.mjGEOM_CAPSULE,
+              [0.09, 1.6, 0.0], [1.35, 0.0, 1.35],
+              [np.cos(np.pi / 8), 0.0, np.sin(np.pi / 8), 0.0],
+              rgba=[0.10, 0.09, 0.08, 1.0])
 
 
 def set_leg_servos(model, kp=LEG_KP, force=LEG_FORCE):
@@ -186,15 +224,20 @@ def visual_angle(eyes, base) -> float:
 
     個眼1つが受け持つ立体角はおよそ dphi^2。新たに暗くなった個眼の数から
     同じ面積の円に直した直径を返す。
+
+    **左右は足さずに大きいほうを取る。** 視角は片眼から見た量なので、
+    両眼で足すと正面の物体を二重に数えることになる。視野を 140 度から
+    170 度に広げたとき両眼の重なりも広がり、幾何の値に対する比が
+    1.4 倍から 2.0 倍へ跳ねた。足していたのが原因だった。
     """
     from fly_vision import DPHI_DEG
 
-    n = 0
+    best = 0
     for now, b in zip(dark_mask(eyes), base):
-        n += int((now & ~b).sum())
-    if n == 0:
+        best = max(best, int((now & ~b).sum()))
+    if best == 0:
         return 0.0
-    return float(2.0 * np.sqrt(n * DPHI_DEG ** 2 / np.pi))
+    return float(2.0 * np.sqrt(best * DPHI_DEG ** 2 / np.pi))
 
 
 def signature(p: dict) -> str:

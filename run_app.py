@@ -1,4 +1,4 @@
-"""ハエ脳ビューアの入口。
+r"""ハエ脳ビューアの入口。
 
 ソースから起動するとき:
     .\.venv\Scripts\python.exe run_app.py
