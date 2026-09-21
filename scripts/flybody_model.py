@@ -127,7 +127,7 @@ def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
                wing_armature: float | None = WING_INERTIA,
                wing_damping: float | None = 1e-5,
                scene: bool = False, scene_seed: int = 0,
-               two_flowers: bool = False):
+               two_flowers: bool = False, extra=None):
     """翅つきモデルを組み立てて返す。翅は位置サーボ化してある。
 
     wing_armature:
@@ -194,6 +194,11 @@ def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
         spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
                                 size=[0, 0, 0.1], pos=[0, 0, 0],
                                 rgba=[0.16, 0.17, 0.19, 1])
+
+    if extra is not None:
+        # compile 前の spec に手を入れるためのフック。
+        # 風景に物を足したい呼び出し側 (24_escape_full.py の捕食者など) が使う。
+        extra(spec)
 
     model = spec.compile()
 

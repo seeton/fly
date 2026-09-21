@@ -22,5 +22,6 @@ MUJOCO_LOG.TXT
 out/*
 !out/*.json
 
-# Claude 用のローカルメモ
+# Claude 用のローカルメモ (引き継ぎメモも含む)
 CLAUDE.md
+HANDOFF.md

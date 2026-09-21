@@ -90,11 +90,15 @@ class FlyEyes:
                  dphi_deg: float = DPHI_DEG, drho_deg: float = DRHO_DEG,
                  tau_photo: float = TAU_PHOTO, tau_emd: float = TAU_EMD,
                  oversample: int = 9, fov_deg: float = FOV_DEG,
-                 res: int | None = None, normalize: bool = True):
+                 res: int | None = None, normalize: bool = True,
+                 spectral: bool = True):
         import mujoco
 
         self._mj = mujoco
         self.normalize = normalize
+        # ハエの光受容器チャンネルで描くかどうか (fly_color.py 参照)。
+        # 切ると人間のカメラの RGB のまま扱うことになる
+        self.spectral = spectral
         self.n_omma = int(np.floor(fov_deg / dphi_deg))
         self.res = int(res if res is not None else self.n_omma * oversample)
         self.M = acceptance_matrix(self.res, fov_deg, dphi_deg, drho_deg)
@@ -118,7 +122,23 @@ class FlyEyes:
             self._has_front = True
         except Exception:
             self._has_front = False
+
+        if self.spectral:
+            from fly_color import install_fly_colors
+            self._fly = install_fly_colors(model)
+            self._orig = {k: getattr(model, k).copy() for k in self._fly}
         self.reset()
+
+    def _use_fly_colors(self, model, on: bool) -> None:
+        """複眼を描く間だけ、場面の色をハエのチャンネルに差し替える。
+
+        人向けのカメラは元の色のままにしておきたいので、描いたら戻す。
+        """
+        if not self.spectral:
+            return
+        src = self._fly if on else self._orig
+        for k, v in src.items():
+            getattr(model, k)[:] = v
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -129,6 +149,7 @@ class FlyEyes:
         self._next_t = 0.0
         self.emd = np.zeros(2)          # 左右それぞれの動き検出器出力
         self.frames = [np.zeros((n, n)), np.zeros((n, n))]
+        self.activity = [np.zeros((n, n)), np.zeros((n, n))]
         self.target_x = np.zeros(2)
         self.target_size = np.zeros(2)
         self.front_x = 0.0
@@ -141,16 +162,31 @@ class FlyEyes:
         self.renderer.update_scene(data, camera=cam, scene_option=self.opt)
         rgb = self.renderer.render().astype(np.float32) / 255.0
         self._rgb = rgb
+        if self.spectral:
+            # 動きを見る経路が使うのは R1-6 (広帯域)。ここは実物でも主に色盲
+            from fly_color import decode
+            return decode(rgb)[3]
         return rgb @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
     def _ommatidia(self, lum):
         """描画像 -> 個眼の像。受容角のボケと個眼間隔の間引きを同時に行う。"""
         return self.M @ lum @ self.M.T
 
-    @staticmethod
-    def _target_mask(rgb):
-        """花 (ピンク) らしい画素。草は緑、地面は茶なので赤が緑を上回る所。"""
-        return (rgb[:, :, 0] - rgb[:, :, 1]) > 0.12
+    def _target_mask(self, rgb):
+        """花らしい画素。
+
+        以前は `(赤 - 緑) > 0.12` と書いていた。**ハエの色覚に赤チャンネルは
+        無い** ので、カメラの RGB という人間側の都合を使っていたことになる。
+
+        いまは (青+緑)/2 と UV の対立で見る。花びらは可視で明るく UV を吸収し、
+        葉は逆に可視が暗い。昆虫が花を見つけるのに使っている性質そのもの。
+        候補を比べて花 +0.571 / 葉 +0.35 と最も離れた指標を選んだ
+        (fly_color.py 参照)。比なので、陰影で全体が暗くなっても効く。
+        """
+        if not self.spectral:
+            return (rgb[:, :, 0] - rgb[:, :, 1]) > 0.12
+        from fly_color import PETAL_THRESHOLD, petal_opponency
+        return petal_opponency(rgb) > PETAL_THRESHOLD
 
     @staticmethod
     def _emd_sum(photo, delayed, normalize: bool = True) -> float:
@@ -182,6 +218,7 @@ class FlyEyes:
             return False
         dt = self.dt_vis
         self._next_t = t + dt
+        self._use_fly_colors(model, True)
         a_p = 1.0 - np.exp(-dt / self.tau_photo)
         a_d = 1.0 - np.exp(-dt / self.tau_emd)
 
@@ -208,6 +245,10 @@ class FlyEyes:
             self.photo[i] += a_p * (om - self.photo[i])
             self.emd[i] = self._emd_sum(self.photo[i], self.delayed[i],
                                         self.normalize)
+            # 個眼ごとの活動。遅延チャンネルとの差なので「いま像が動いた量」に
+            # あたる。視葉 (ラミナ/メダラ/ロブラ) が実際に扱っている信号で、
+            # 脳の絵を光らせるのにそのまま使える (escape_circuit.BrainPanel)。
+            self.activity[i] = np.abs(self.photo[i] - self.delayed[i])
             self.delayed[i] += a_d * (self.photo[i] - self.delayed[i])
 
         if self._has_front:
@@ -222,6 +263,7 @@ class FlyEyes:
                 self.front_x = (cx / (mask.shape[1] - 1)) * 2.0 - 1.0
             else:
                 self.front_x = 0.0
+        self._use_fly_colors(model, False)
         return True
 
     # --- 制御に使う量 (どれも任意単位。ゲインは学習に任せる) ---
