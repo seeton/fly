@@ -8,6 +8,11 @@ __pycache__/
 data/
 out/
 
+# PyInstaller の出力
+build/
+dist/
+*.spec
+
 # ローカル固有・ログ
 .claude/settings.local.json
 MUJOCO_LOG.TXT
