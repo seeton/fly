@@ -124,6 +124,41 @@ def euler(q):
             np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
 
 
+REWARD_TERMS = (
+    ("生存",   "落ちずに飛んでいること"),
+    ("高度",   "目標高度からのずれ"),
+    ("的",     "報酬 (花) までの水平距離"),
+    ("機首",   "向きを保っているか"),
+    ("パワー", "翅が空気に渡すパワー (実物の上限 300-800 erg/s)"),
+    ("傾き",   "ロール角 (罰)"),
+    ("回転",   "角速度 (罰)"),
+)
+
+
+def reward_terms(dz, dxy, yaw_b, power_ema, roll_b, spin):
+    """報酬の内訳 (毎秒あたり)。`REWARD_TERMS` と同じ順で返す。
+
+    学習 (`13_train_flight.py`) が使うのと **同じ式**。アプリの live 画面は
+    同じ関数を毎ステップ呼んで内訳を画面に出す。式を触ったら両方が動く。
+
+    ここが最重要。penalty を線形で引くと「すぐ死んだ方が高得点」になり、
+    探索は飛べる解を捨てて即墜落する解を選ぶ。だから加点は有界な正の項に
+    してあり、生存が常に得になる。
+    """
+    return (1.0,
+            2.0 / (1.0 + (dz / 5.0) ** 2),
+            1.0 / (1.0 + (dxy / 5.0) ** 2),
+            1.0 / (1.0 + (yaw_b / 0.6) ** 2),
+            1.0 / (1.0 + (abs(power_ema) / 800.0) ** 2),
+            -0.4 * abs(roll_b),
+            -0.005 * min(spin, 100.0))
+
+
+def reward_rate(dz, dxy, yaw_b, power_ema, roll_b, spin):
+    """報酬の毎秒あたりの値 (内訳の和)。"""
+    return float(sum(reward_terms(dz, dxy, yaw_b, power_ema, roll_b, spin)))
+
+
 def rollout(x, target=(0.0, 0.0, 10.0), seconds=0.5, z0=10.0, record=False):
     """1エピソード回して報酬と軌跡を返す。
 
@@ -238,13 +273,7 @@ def rollout(x, target=(0.0, 0.0, 10.0), seconds=0.5, z0=10.0, record=False):
         power_ema += ema_alpha * (p_now - power_ema)
         power_sum += p_now
         power_n += 1
-        reward += DT * (1.0
-                        + 2.0 / (1.0 + (dz / 5.0) ** 2)
-                        + 1.0 / (1.0 + (dxy / 5.0) ** 2)
-                        + 1.0 / (1.0 + (yaw_b / 0.6) ** 2)
-                        + 1.0 / (1.0 + (abs(power_ema) / 800.0) ** 2)
-                        - 0.4 * abs(roll_b)
-                        - 0.005 * min(spin, 100.0))
+        reward += DT * reward_rate(dz, dxy, yaw_b, power_ema, roll_b, spin)
         alive += 1
 
         if tilt > 1.4 or d.qpos[2] < 0.5:

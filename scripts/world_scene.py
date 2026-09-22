@@ -125,15 +125,20 @@ def _lights(spec):
     lt.specular = [0.25, 0.25, 0.25]
 
 
-def _flower(spec, pos, n_petals=7, tag="flower", make_materials=True):
+def _flower(spec, pos, n_petals=7, tag="flower", make_materials=True,
+            parent=None):
     """花。黄色い中心 + 花びら + 茎。位置はサイト `<tag>` で引ける。
 
     2つ置くときも **同じ材質** を使う。見た目で区別できてしまうと
     「匂いで選ぶ」話にならないため。
+
+    parent に body を渡すとその中に生やす。mocap の body を渡せば
+    **走らせながら花を動かせる** (`add_movable_flower`)。その場合 pos は
+    body から見た相対位置なので、ふつうは原点の上に立てる。
     """
     import mujoco
 
-    wb = spec.worldbody
+    wb = spec.worldbody if parent is None else parent
     if make_materials:
         _mat(spec, "petal_mat", [0.95, 0.38, 0.58, 1.0], shininess=0.3)
         _mat(spec, "center_mat", [0.98, 0.82, 0.16, 1.0], shininess=0.5)
@@ -249,6 +254,26 @@ def _posts(spec, rng, n_posts=40):
         g.pos = [x, y, h]
         g.material = f"post_mat{i}"
         g.contype, g.conaffinity = 0, 0
+
+
+def add_movable_flower(spec, pos, tag: str = "flower", n_petals: int = 7,
+                       make_materials: bool = True) -> None:
+    """動かせる花を足す。mocap の body に載せるので `data.mocap_pos` で移せる。
+
+    アプリの live 画面が使う。報酬 (花) を置き直すたびにモデルを組み直すと
+    2.6 秒かかって飛行が途切れるが、mocap なら 1 行で動く。当たり判定は
+    元の `_flower` と同じく持たせない。
+    """
+    b = spec.worldbody.add_body()
+    b.name = f"{tag}_body"
+    b.mocap = True
+    b.pos = [float(v) for v in pos]
+    # 茎は body のローカル原点から下へ伸ばす。高さは pos[2] をそのまま使う
+    _flower(spec, [0.0, 0.0, float(pos[2])], n_petals=n_petals, tag=tag,
+            make_materials=make_materials, parent=b)
+    # body 自身が pos[2] の高さにいると花が2倍の高さになるので、
+    # body は地面の高さに置き、中身だけ持ち上げる
+    b.pos = [float(pos[0]), float(pos[1]), 0.0]
 
 
 def add_scene(spec, seed: int = 0, style: str = "meadow",

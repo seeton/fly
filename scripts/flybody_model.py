@@ -127,7 +127,8 @@ def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
                wing_armature: float | None = WING_INERTIA,
                wing_damping: float | None = 1e-5,
                scene: bool = False, scene_seed: int = 0,
-               two_flowers: bool = False, extra=None):
+               two_flowers: bool = False, scene_flower: bool = True,
+               extra=None):
     """翅つきモデルを組み立てて返す。翅は位置サーボ化してある。
 
     wing_armature:
@@ -189,7 +190,10 @@ def load_model(wing_kp: float = 0.05, wing_kv: float = 5e-4,
 
     if scene:
         from world_scene import add_scene
-        add_scene(spec, seed=scene_seed, two_flowers=two_flowers)
+        # scene_flower=False は「花は呼ぶ側が置く」の意味。アプリの live 画面が
+        # 動かせる花 (mocap) を extra= で足すのに使う
+        add_scene(spec, seed=scene_seed, two_flowers=two_flowers,
+                  flower=scene_flower)
     elif add_floor:
         spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
                                 size=[0, 0, 0.1], pos=[0, 0, 0],

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
 
 from . import theme, videos
 from .core import Brain, NotFound
+from .livepage import LivePage
 from .player import VideoPlayer
 from .view3d import Brain3DView, Layer
 
@@ -814,6 +815,9 @@ class MainWindow(QMainWindow):
         title = label("ハエ脳ビューア", "appTitle")
         self.headline = label("読み込み中…", "headline")
 
+        # 「飛ばす」が最初。脳をぐるぐる回して眺めるのではなく、
+        # 脳・体・視界を並べて動かすのがこのアプリの主目的
+        self.seg_live = QPushButton("飛ばす")
         self.seg_circuit = QPushButton("回路")
         self.seg_video = QPushButton("動画")
         seg_bar = QWidget()
@@ -821,13 +825,13 @@ class MainWindow(QMainWindow):
         sb = QHBoxLayout(seg_bar)
         sb.setContentsMargins(3, 3, 3, 3)
         sb.setSpacing(2)
-        for i, b in enumerate((self.seg_circuit, self.seg_video)):
+        for i, b in enumerate((self.seg_live, self.seg_circuit, self.seg_video)):
             b.setObjectName("segment")
             b.setCheckable(True)
             b.setAutoExclusive(True)
             b.clicked.connect(lambda _=False, i=i: self.stack.setCurrentIndex(i))
             sb.addWidget(b)
-        self.seg_circuit.setChecked(True)
+        self.seg_live.setChecked(True)
 
         header = QWidget()
         header.setObjectName("header")
@@ -840,13 +844,15 @@ class MainWindow(QMainWindow):
         hl.addWidget(seg_bar)
 
         # --- 中身 ---
+        self.live = LivePage()
         self.circuit = CircuitPage(self.brain, self.pool)
         self.video = VideoPage()
+        self.live.status.connect(self.set_status)
         self.circuit.status.connect(self.set_status)
         self.video.status.connect(self.set_status)
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.circuit)
-        self.stack.addWidget(self.video)
+        for page in (self.live, self.circuit, self.video):
+            self.stack.addWidget(page)
         self.stack.currentChanged.connect(self._on_page)
 
         # --- 下の帯 ---
@@ -876,6 +882,9 @@ class MainWindow(QMainWindow):
 
         self.circuit.setEnabled(False)
         QTimer.singleShot(60, self.load_brain)
+        # 画面が出てから始める。モデルの組み立てに 2.6 秒かかるので、
+        # 注釈の読み込み (0.3 秒) より後ろに置いて窓を先に見せる
+        QTimer.singleShot(200, self.live.start)
 
     # ---- 起動時の読み込み ----
 
@@ -915,7 +924,7 @@ class MainWindow(QMainWindow):
     def _load_failed(self, msg: str) -> None:
         self.headline.setText("データを読み込めませんでした")
         self.set_status(msg, False)
-        self.stack.setCurrentIndex(1)
+        self.stack.setCurrentIndex(2)
         self.seg_video.setChecked(True)
         self.circuit.info.setText(
             msg + "\n動画タブは data/ が無くても見られます。")
@@ -927,13 +936,16 @@ class MainWindow(QMainWindow):
         self.bar.setVisible(busy)
 
     def _on_page(self, idx: int) -> None:
-        if idx == 0:
-            self.video.player.player.pause()
-        else:
+        # 見ていないページは止める。live は回しっぱなしだと CPU を丸ごと使う
+        self.live.set_visible(idx == 0)
+        if idx == 2:
             self.video.refresh()
+        else:
+            self.video.player.player.pause()
 
     def closeEvent(self, event) -> None:
         self.video.player.stop()
+        self.live.stop()
         super().closeEvent(event)
 
 

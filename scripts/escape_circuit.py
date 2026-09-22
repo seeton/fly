@@ -54,6 +54,13 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Line3DCollection  # noqa: E402
 
+# 点群と、そこへ入力を配る対応づけは brain_glow に置いてある。アプリ
+# (PySide6) も同じものを使うので、navis / matplotlib の要らない側に分けた。
+# 以前ここに定義があった名前は、そのまま引けるように通しておく。
+from brain_glow import (CHIASM_FLIP, LEG, OLFACTORY, OPTIC,  # noqa: E402,F401
+                        CloudMap, region_kind, region_side,
+                        sample_cns_synapses)
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "malecns"
 SKEL = DATA / "skeletons"
@@ -186,95 +193,6 @@ def build_circuit(n_visual: int = 8, n_motor: int = 2) -> dict:
             "motor_ids": np.array(motor_ids), "syn_in": syn_in, "syn_out": syn_out}
 
 
-CLOUD = OUT / "cns_synapse_cloud.npz"
-
-
-def sample_cns_synapses(n_points: int = 45000, seed: int = 0,
-                        refresh: bool = False):
-    """中枢神経系まるごとのシナプスを、まんべんなく間引いて取る。
-
-    位置に加えて **脳領域 (primary_post)** も持って帰る。どの領域が
-    どの感覚の入力を受けているかが分かると、「実際に入力がある所が光る」
-    という描き方ができる。
-
-    先頭から N 行取ると body 順に並んでいて空間的にも領域的にも偏るので、
-    ストリームで読みながら一定の確率で拾う。
-    """
-    if CLOUD.exists() and not refresh:
-        z = np.load(CLOUD, allow_pickle=True)
-        # 点の数もキャッシュの一部。少ない試し取りのファイルが残っていると、
-        # 45,000 点を頼んだのに 1,000 点が返ってくる
-        if "roi" in z.files and len(z["pts"]) >= n_points:
-            return z["pts"][:n_points], z["roi"][:n_points]
-
-    import pyarrow as pa
-    import pyarrow.dataset as ds
-
-    print(f"全CNSのシナプスを間引き中 ({SYN.stat().st_size/1e9:.1f} GB を流し読み) ...")
-    rng = np.random.default_rng(seed)
-    total = 311_830_000
-    keep_p = min(1.0, n_points * 3.0 / total)
-    d = ds.dataset(SYN, format="feather")
-    chunks, rois = [], []
-    for b in d.scanner(columns=["x_pre", "y_pre", "z_pre", "primary_post"],
-                       batch_size=1 << 20).to_batches():
-        take = np.nonzero(rng.random(b.num_rows) < keep_p)[0]
-        if not len(take):
-            continue
-        chunks.append(np.column_stack(
-            [b.column(c).to_numpy(zero_copy_only=False)[take]
-             for c in ("x_pre", "y_pre", "z_pre")]))
-        # **先に間引いてから** Python の文字列に直す。100万行のバッチから残すのは
-        # 400行ほどなのに、バッチ全体を to_pylist() すると 3億個の Python 文字列を
-        # 作ることになり、そこだけで数十分かかっていた
-        rois.append(np.asarray(
-            b.column("primary_post").take(pa.array(take)).to_pylist(), dtype=object))
-    pts = np.vstack(chunks)
-    roi = np.concatenate(rois)
-    if len(pts) > n_points:
-        sel = rng.choice(len(pts), n_points, replace=False)
-        pts, roi = pts[sel], roi[sel]
-    print(f"  {len(pts):,} 点。領域の上位: " + ", ".join(
-        f"{k}({v})" for k, v in
-        sorted(((k, int((roi == k).sum())) for k in set(roi.tolist())),
-               key=lambda kv: -kv[1])[:6]))
-    OUT.mkdir(exist_ok=True)
-    np.savez_compressed(CLOUD, pts=pts, roi=roi.astype(str))
-    return pts, roi.astype(str)
-
-
-# 領域 -> 入力の種類。ここに無い領域は「この環境では入力を作っていない」
-OPTIC = ("ME", "LO", "LOP", "LA", "AME")      # 視葉。複眼から retinotopic に入る
-OLFACTORY = ("AL",)                           # 触角葉。触角から入る
-LEG = ("LegNp",)                              # 脚神経核。脚の固有受容が入る
-
-# 外側キアズマ (ラミナ -> 髄質) で視野の前後が入れ替わる領域。
-# 内側キアズマ (髄質 -> ロブラ) でもう一度入れ替わるので LO/LOP は元に戻る
-CHIASM_FLIP = ("ME", "AME")
-
-
-def region_kind(roi: str) -> str:
-    """領域名 -> optic / olfactory / leg / other。"""
-    base = str(roi).split("(")[0]
-    if base in OPTIC:
-        return "optic"
-    if base in OLFACTORY:
-        return "olfactory"
-    if base in LEG:
-        return "leg"
-    return "other"
-
-
-def region_side(roi: str, x: float, mid_x: float) -> str:
-    """領域名から左右を取る。名前に無ければ位置で決める (x は右 -> 左)。"""
-    s = str(roi)
-    if "(R)" in s:
-        return "R"
-    if "(L)" in s:
-        return "L"
-    return "L" if x > mid_x else "R"
-
-
 def load_circuit(n_visual: int = 8, n_motor: int = 2, refresh: bool = False) -> dict:
     OUT.mkdir(exist_ok=True)
     if CACHE.exists() and not refresh:
@@ -342,16 +260,24 @@ class BrainPanel:
                    [SYN_HOT["out"]] * len(C["syn_out"]))
         self.fired = np.zeros(len(self.syn_pts), dtype=bool)
         self.spin, self.elev = spin, elev
-        # 中枢神経系まるごとの地の活動
-        if n_cloud > 0:
-            self.cloud, self.cloud_roi = sample_cns_synapses(n_cloud, seed, refresh)
+        # 中枢神経系まるごとの地の活動。点群と「どの点にどの入力が届くか」は
+        # brain_glow.CloudMap が持つ (アプリの live 表示と同じもの)
+        self.map = CloudMap(max(n_cloud, 0), n_omma=n_omma, seed=seed,
+                            refresh=refresh) if n_cloud > 0 else None
+        if self.map is not None:
+            self.cloud, self.cloud_roi = self.map.pts, self.map.roi
+            self.kind = self.map.kind
+            self.optic_eye, self.optic_idx = self.map.optic_eye, self.map.optic_idx
+            self.leg_group, self.leg_names = self.map.leg_group, self.map.leg_names
         else:
             self.cloud = np.zeros((0, 3))
             self.cloud_roi = np.zeros(0, dtype=str)
+            self.kind = np.zeros(0, dtype=object)
+            self.optic_eye = self.optic_idx = self.leg_group = np.zeros(0, dtype=int)
+            self.leg_names = []
+        self.n_omma = n_omma
         self._optic = None
         self._regions = None
-        self._mask_cache: dict = {}
-        self._map_retinotopy(n_omma)
 
         # --- 描画の準備 ---
         all_xyz = np.vstack([np.vstack(segs), self.syn_pts]
@@ -403,96 +329,6 @@ class BrainPanel:
         self.syn_dim = np.array(matplotlib.colors.to_rgb("#202430"))
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _grid_index(v: np.ndarray, n: int) -> np.ndarray:
-        """座標の並びを 0..n-1 の格子の添字に落とす。
-
-        端の外れ値で潰れないよう 2-98 パーセンタイルで正規化して切り詰める。
-        """
-        lo, hi = np.percentile(v, [2.0, 98.0])
-        u = (v - lo) / max(float(hi - lo), 1e-9)
-        return np.clip((u * n).astype(int), 0, n - 1)
-
-    def _map_retinotopy(self, n_omma: int) -> None:
-        """点群の各点を「どの入力が届く場所か」に対応づける。
-
-        視葉の点は複眼の個眼格子 (n x n) の 1 マスに落とす。視葉は
-        **retinotopic** — 個眼の並びが髄質 (ME)・ロブラ (LO)・ロブラ板 (LOP) の
-        柱の並びにそのまま保たれている — ので、葉の中での位置がそのまま
-        視野の中での向きにあたる。
-
-        脳の座標系は点群から実際に確かめた:
-
-            x  右 -> 左   ME(R) x~17000 / ME(L) x~80000
-            y  背 -> 腹   SMP y~11900 / AL y~27600 / GNG y~40400
-            z  前 -> 後   AL z~15300 / 萼 z~33900 / 神経索 z~100000
-
-        使うのは y (仰角) と z (方位) の2軸だけ。x は視葉では **柱の深さ**
-        (ラミナ側からロブラ側へ層が重なる向き) にあたり、同じ柱の中では
-        どの層も視野の同じ点を見ているので落として構わない。
-
-        画像側の向きは複眼カメラの姿勢から測った。左右どちらの眼も
-        画像の上が背側で、列は **左眼では前へ / 右眼では後ろへ** 増える。
-        方位はさらに外側キアズマで前後が入れ替わるので、ME と AME だけ
-        もう一度ひっくり返す (`CHIASM_FLIP`)。
-
-        **ここは想定**: 葉の中の位置を葉ごとのバウンディングボックスで
-        正規化して格子に均等に割っている。実際の柱の並びは一様ではないし、
-        葉のどの隅が視野のどの隅かは Male CNS の注釈からは読めない。
-        向きの規則 (背腹は保存、前後はキアズマで反転) だけが解剖の事実。
-
-        脚神経核は領域名 `LegNp(T2)(R)` がそのまま脚の名前なので、
-        推測なしで関節と結べる。
-        """
-        n = len(self.cloud)
-        self.n_omma = n_omma
-        self.kind = np.array([region_kind(r) for r in self.cloud_roi])
-        self.optic_eye = np.full(n, -1, dtype=int)
-        self.optic_idx = np.zeros(n, dtype=int)
-        self.leg_group = np.full(n, -1, dtype=int)
-        self.leg_names: list[str] = []
-        if n == 0:
-            return
-
-        mid_x = float(np.median(self.cloud[:, 0]))
-        base = np.array([str(r).split("(")[0] for r in self.cloud_roi])
-        side = np.array([region_side(r, x, mid_x)
-                         for r, x in zip(self.cloud_roi, self.cloud[:, 0])])
-
-        for b, s in sorted(set(zip(base[self.kind == "optic"].tolist(),
-                                   side[self.kind == "optic"].tolist()))):
-            m = (self.kind == "optic") & (base == b) & (side == s)
-            q = self.cloud[m]
-            row = self._grid_index(q[:, 1], n_omma)     # 背 -> 腹 = 行 0 -> n-1
-            col = self._grid_index(q[:, 2], n_omma)     # 前 -> 後
-            eye = 0 if s == "L" else 1                  # 左の視葉は左眼を見る
-            if eye == 0:                                # 左眼の画像は列が前へ増える
-                col = n_omma - 1 - col
-            if b in CHIASM_FLIP:
-                col = n_omma - 1 - col
-            self.optic_eye[m] = eye
-            self.optic_idx[m] = row * n_omma + col
-
-        # 脚神経核は `LegNp(T2)(R)` のように **脚の番号まで名前に入っている**。
-        # 領域名の頭 (LegNp) だけで束ねると T1/T2/T3 が 1 群に潰れるので、
-        # 括弧の中まで見て 1 点ずつ振り分ける
-        for i in np.nonzero(self.kind == "leg")[0]:
-            seg = [q.rstrip(")") for q in str(self.cloud_roi[i]).split("(")
-                   if q[:1] == "T" and q[1:2].isdigit()]
-            if not seg:
-                continue
-            key = f"{seg[0]}_{'left' if side[i] == 'L' else 'right'}"
-            if key not in self.leg_names:
-                self.leg_names.append(key)
-            self.leg_group[i] = self.leg_names.index(key)
-
-        counts = {k: int((self.kind == k).sum())
-                  for k in ("optic", "olfactory", "leg", "other")}
-        print("点群の内訳: " + " / ".join(f"{k} {v:,}" for k, v in counts.items())
-              + f"   視葉 -> {n_omma}x{n_omma} の個眼格子、"
-              + f"脚 -> {len(self.leg_names)} 群")
-
-    # ------------------------------------------------------------------
     def attach_optic_drive(self, times, photo, motion,
                            w_lum: float = 0.32, w_mot: float = 0.85,
                            gamma: float = 0.80) -> None:
@@ -515,12 +351,8 @@ class BrainPanel:
         # 個眼の数が retinotopy を張ったときと違うと、添字が黙って別の
         # 個眼を指す (落ちない。絵が静かに嘘になる)。複眼の視野や個眼間角を
         # いじると n_omma が変わるので、ここで必ず突き合わせる
-        if ph.shape[2] != self.n_omma ** 2:
-            raise ValueError(
-                f"個眼の数が合わない: 入力は 1眼 {ph.shape[2]} 個 "
-                f"({int(round(ph.shape[2] ** 0.5))}x)、"
-                f"retinotopy は {self.n_omma}x{self.n_omma}。"
-                f"BrainPanel(..., n_omma=eyes.n_omma) を渡すこと")
+        if self.map is not None:
+            self.map.check_omma(ph.shape[2])
         p_hi = max(float(np.percentile(ph, 99.0)), 1e-9)
         m_hi = max(float(np.percentile(mo, 99.5)), 1e-9)
         b = (w_lum * np.clip(ph / p_hi, 0.0, 1.0)
@@ -530,17 +362,10 @@ class BrainPanel:
               f"明るさの 99% 点 {p_hi:.3f} / 動きの 99.5% 点 {m_hi:.4f}")
 
     def region_mask(self, key: str) -> np.ndarray:
-        """領域名にあたる点の添字。
-
-        `AL` のように頭だけ書けば左右とも、`AL(L)` と書けばその側だけ、
-        `LegNp(T2)(R)` のように最後まで書けばその脚だけに当たる。
-        """
-        if key in self._mask_cache:
-            return self._mask_cache[key]
-        roi = np.asarray([str(r) for r in self.cloud_roi])
-        idx = np.nonzero((roi == key) | np.char.startswith(roi, key + "("))[0]
-        self._mask_cache[key] = idx
-        return idx
+        """領域名にあたる点の添字 (`CloudMap.region_mask`)。"""
+        if self.map is None:
+            return np.zeros(0, dtype=int)
+        return self.map.region_mask(key)
 
     def region_level(self, key: str) -> float:
         """直前に描いた絵での、その領域の明るさの平均 0..1。
