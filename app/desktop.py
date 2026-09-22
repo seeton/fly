@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
 
 from . import theme, videos
 from .core import Brain, NotFound
+from .gomoku import GomokuPage
 from .livepage import LivePage
 from .player import VideoPlayer
 from .view3d import Brain3DView, Layer
@@ -820,12 +821,14 @@ class MainWindow(QMainWindow):
         self.seg_live = QPushButton("飛ばす")
         self.seg_circuit = QPushButton("回路")
         self.seg_video = QPushButton("動画")
+        self.seg_gomoku = QPushButton("五目並べ")
         seg_bar = QWidget()
         seg_bar.setObjectName("segmentBar")
         sb = QHBoxLayout(seg_bar)
         sb.setContentsMargins(3, 3, 3, 3)
         sb.setSpacing(2)
-        for i, b in enumerate((self.seg_live, self.seg_circuit, self.seg_video)):
+        for i, b in enumerate((self.seg_live, self.seg_circuit, self.seg_video,
+                               self.seg_gomoku)):
             b.setObjectName("segment")
             b.setCheckable(True)
             b.setAutoExclusive(True)
@@ -847,11 +850,13 @@ class MainWindow(QMainWindow):
         self.live = LivePage()
         self.circuit = CircuitPage(self.brain, self.pool)
         self.video = VideoPage()
+        self.gomoku = GomokuPage()
         self.live.status.connect(self.set_status)
         self.circuit.status.connect(self.set_status)
         self.video.status.connect(self.set_status)
+        self.gomoku.status.connect(self.set_status)
         self.stack = QStackedWidget()
-        for page in (self.live, self.circuit, self.video):
+        for page in (self.live, self.circuit, self.video, self.gomoku):
             self.stack.addWidget(page)
         self.stack.currentChanged.connect(self._on_page)
 
