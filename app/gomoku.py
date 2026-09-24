@@ -1,17 +1,22 @@
-"""五目並べのタブ — 報酬だけで覚えた蝿と打つ。
+"""五目並べのタブ — 勝ち負けだけで覚えた蝿と打つ。
 
-盤は 9x9、五目で勝ち。蝿は `scripts/gomoku_env.py` の打ち手で、重み 159 個を
-`scripts/30_train_gomoku.py` が CMA-ES で決めたもの。**定石は一つも入っていない**。
-渡した報酬は「打てた」「並べた」「止めた」「勝った」の4つだけで、どこが良い手か
-は一度も教えていない。
+盤は 15x15、五目で勝ち (自由形)。打ち手は2通りあり、ある方を使う:
 
-**盤の点数をそのまま出す。** 右に出しているのは蝿が 81 マス全部につけた点数で、
-こちらで作った色付けではない (脳の点群を実入力だけから光らせているのと同じ)。
-石のあるマスにも点数は出る — そこを選ばない理由も報酬から覚えたものなので、
-隠さずに見せる。
+  網 (`out/gomoku_net.pt`)      3x3 の畳み込みの網を、自分と打って勝ち負けだけから
+                                覚えさせたもの (`scripts/32_train_gomoku_net.py`)。
+                                その目で候補を選び、局面を見込みで評価しながら読む
+  前の打ち手 (`gomoku_policy.json`)  重み 159 個を CMA-ES で探したもの
+                                (`scripts/30_train_gomoku.py`)。torch が無いときはこちら
 
-**物差しはこの局面の中の相対**。点数に単位はなく、翅や脚の速さのように測って
-決めた固定の物差しが無い。局面ごとに最小〜最大で割っていることを画面にも書く。
+どちらも**定石は一つも入っていない**。読みに入る規則は「五で勝ち」「石のある所には
+打てない」だけ。
+
+**盤の色は蝿の目そのもの。** 網なら「読む前に目だけで見た手の確からしさ」、
+前の打ち手なら全マスにつけた点数。こちらで作った色付けではない (脳の点群を実入力
+だけから光らせているのと同じ)。単位が無いので、局面ごとの上位3割を伸ばして塗る。
+
+**読みは別のスレッドで回す。** 網は1手に 0.5〜1 秒読むので、画面のスレッドで
+回すとその間固まる (`CLAUDE.md`: 重い処理は UI スレッドで呼ばない)。
 
 **コネクトームとは別物**。ここで動いているのは学習した重みで、ハエの神経回路
 そのものではない。回路タブや飛翔タブと混ぜて読まないよう、画面にも断っておく。
@@ -23,7 +28,8 @@ import json
 import sys
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import (QObject, QPointF, QRectF, QRunnable, Qt, QThreadPool,
+                            QTimer, Signal, Slot)
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
                                QPushButton, QSizePolicy, QVBoxLayout, QWidget)
@@ -38,18 +44,180 @@ FLY = 1          # 盤の値。蝿は +1、人は -1 (蝿の打ち手から見�
 HUMAN = -1
 FLY_COLOR = theme.AMBER
 HUMAN_COLOR = theme.CYAN
+N = 15
 
 
-def available() -> tuple[bool, str]:
-    """この環境で遊べるか。無理なら理由をそのまま画面に出す。"""
+# ---------------------------------------------------------------- 打ち手
+
+class NetBrain:
+    """畳み込みの網 + 読み。学習と同じ `gomoku_net.Player` で打つ。"""
+
+    kind = "網"
+
+    def __init__(self) -> None:
+        import torch
+        import gomoku_net as M
+
+        # 読みは1局面ずつ網に通す。スレッドを何本も立てると、CPU が混んでいるとき
+        # 取り合いで 25 倍遅くなった (1局面 4 ms → 104 ms)
+        torch.set_num_threads(1)
+        self._torch, self._M = torch, M
+        self._mtime = 0.0
+        self.net = self.player = None
+        self.refresh()
+
+    def refresh(self) -> bool:
+        """網が書き換わっていたら読み直す。新しい対局のたびに呼ぶ。
+
+        学習 (`32_train_gomoku_net.py`) を裏で回したまま遊べるように。学習側は
+        置き換えで書くので、書きかけを読むことはない。
+        """
+        path = OUT / "gomoku_net.pt"
+        m = path.stat().st_mtime
+        if m == self._mtime:
+            return False
+        ck = self._torch.load(path, weights_only=False)
+        net = self._M.FlyNet(**ck["config"]).eval()
+        net.load_state_dict(ck["net"])
+        meta_p = OUT / "gomoku_net.json"
+        self.meta = json.loads(meta_p.read_text("utf-8")) if meta_p.exists() else {}
+        self.net = net
+        # 読む回数は、物差しで測ったときと同じにする (強さの数字と合わせるため)
+        self.player = self._M.Player(net, sims=self.meta.get("eval_sims", 200))
+        self._mtime = m
+        return True
+
+    def heat(self, board):
+        return self.player.prior(board)
+
+    def move(self, board, rng):
+        return self.player.move(board, rng)
+
+    def plan(self, board) -> int:
+        return -1          # 読むのは重いので、打つ前の「ここに打つ」は出さない
+
+    def after(self, board) -> list[str]:
+        t = self.player.last_tree
+        if t is None:
+            return []
+        vis = t.visits()
+        # 同点の並びは argmax (打った手) と同じく、先に出てくるマスを上にする
+        order = np.argsort(-vis, kind="stable")[:3]
+        r = t.root
+        v = float(r.W.sum() / max(r.N.sum(), 1))
+        rows = [f"{int(i) // N + 1} 段 {int(i) % N + 1} 列 ({int(vis[i])} 回)"
+                for i in order if vis[i] > 0]
+        return [f"読んだ回数の上位: " + " / ".join(rows),
+                f"打つ前の見込み (蝿から見て): {v:+.2f}  (+1 勝ち / -1 負け)"]
+
+    def note(self) -> str:
+        m = self.meta
+        cfg = m.get("config", {})
+        nw = sum(p.numel() for p in self.net.parameters())
+        head = (f"打ち手: 3x3 の畳み込み {1 + 2 * cfg.get('blocks', 0)} 層 "
+                f"({cfg.get('ch', '?')} ch、重み {nw} 個) を、自分と {m.get('games_total', 0)} 局"
+                f"打って覚えさせたもの ({m.get('hours', 0):.1f} 時間)。"
+                f"1手ごとに {self.player.sims} 回読む。\n\n")
+        return head + _scoreboard(m.get("scoreboard")) + (
+            "教えたのは勝ったか負けたかだけ。定石も、形の良し悪しも、「四は止めろ」も"
+            "書いていない。読みに入る規則は「五で勝ち」「石のある所には打てない」だけ。\n\n"
+            "盤の色は、網が読む前に目だけで見た手の確からしさ。打ったあとに、読んだ末に"
+            "どこを何回読んだかを出す。\n\n")
+
+
+class OldBrain:
+    """前の打ち手 (重み 159 個)。torch が無いときはこちらで打つ。"""
+
+    kind = "前の打ち手"
+
+    def __init__(self) -> None:
+        import gomoku_env as G
+
+        saved = json.loads((OUT / "gomoku_policy.json").read_text("utf-8"))
+        self.meta = saved
+        # 読みの深さも解の json から取る。**学習したときと同じ深さで打つ**
+        self.fly = G.FlyPlayer(saved.get("K", 6), depth=saved.get("depth", 0)
+                               ).set_flat(np.array(saved["x"]))
+
+    def heat(self, board):
+        return self.fly.scores(board)
+
+    def move(self, board, rng):
+        return self.fly.move(board, rng)
+
+    def plan(self, board) -> int:
+        return self.fly.move(board)
+
+    def refresh(self) -> bool:
+        return False
+
+    def after(self, board) -> list[str]:
+        return []
+
+    def note(self) -> str:
+        m = self.meta
+        return (f"打ち手: 重み {m.get('dim', '?')} 個を CMA-ES で決めたもの "
+                f"(「{m.get('label', '?')}」の段)。読み {m.get('depth', 0)} 手。\n\n"
+                + _scoreboard(m.get("scoreboard")) +
+                "渡した報酬は「打てた」「止めた」「生き延びた」「勝った」だけで、"
+                "どこが良い手かは教えていない。\n\n")
+
+
+def _scoreboard(sb) -> str:
+    """学習のときに測った強さをそのまま出す (文章で書くと学習し直したとき先に古くなる)。"""
+    if not sb:
+        return ""
+    rows = [f"{k}: 勝ち {v['win']*100:.0f} % / 引き分け {v['draw']*100:.0f} %"
+            for k, v in sb.items() if isinstance(v, dict)]
+    if not rows:
+        return ""
+    return f"実測 (各 {sb.get('games', '?')} 局、先後半々):\n  " + "\n  ".join(rows) + "\n\n"
+
+
+def load_brain():
+    """使える打ち手を返す。網を優先し、無ければ前の打ち手。どちらも無ければ理由。"""
     try:
         import gomoku_env  # noqa: F401
     except Exception as exc:
-        return False, f"scripts/gomoku_env.py を読み込めません ({exc})。"
-    if not (OUT / "gomoku_policy.json").exists():
-        return False, ("out/gomoku_policy.json がありません (学習した打ち方)。\n"
-                       "    .\\.venv\\Scripts\\python.exe scripts\\30_train_gomoku.py")
-    return True, ""
+        return None, f"scripts/gomoku_env.py を読み込めません ({exc})。"
+    if (OUT / "gomoku_net.pt").exists():
+        try:
+            return NetBrain(), ""
+        except Exception as exc:          # torch が無い (固めた exe など)
+            fallback = f"(網は使えない: {exc})"
+        else:
+            fallback = ""
+    else:
+        fallback = ""
+    if (OUT / "gomoku_policy.json").exists():
+        return OldBrain(), fallback
+    return None, ("学習した打ち手がありません。\n"
+                  "    .\\.venv\\Scripts\\python.exe scripts\\32_train_gomoku_net.py")
+
+
+class _MoveSignals(QObject):
+    done = Signal(int, int)        # (対局の通し番号, 打つマス)
+
+
+class _MoveJob(QRunnable):
+    """蝿の読みを別スレッドで回す。
+
+    `desktop.Job` と同じ理由で、配り終えるまで Python 側で握っておく
+    (握らないと signals ごと回収され、結果が黙って捨てられる)。
+    """
+
+    def __init__(self, brain, board, rng, game_id: int):
+        super().__init__()
+        self.signals = _MoveSignals()
+        self.brain, self.board, self.rng, self.game_id = brain, board, rng, game_id
+
+    @Slot()
+    def run(self) -> None:
+        mv = int(self.brain.move(self.board, self.rng))
+        try:
+            self.signals.done.emit(self.game_id, mv)
+        except RuntimeError:
+            pass                       # 窓を閉じたあと
 
 
 # ---------------------------------------------------------------- 盤
@@ -67,7 +235,7 @@ class BoardView(QWidget):
         self.last = -1                # 最後に打たれたマス
         self.best = -1                # 蝿がいま打つなら選ぶマス
         self.line = ()                # 勝った五目の並び
-        self.setMinimumSize(420, 420)
+        self.setMinimumSize(560, 560)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
 
@@ -104,7 +272,7 @@ class BoardView(QWidget):
         p.setPen(QPen(QColor(theme.LINE), 1))
         p.drawRoundedRect(board_rect, 8, 8)
 
-        # 蝿の点数。**上位だけ**塗る。全部を最小〜最大に伸ばすと 81 マスが
+        # 蝿の点数。**上位だけ**塗る。全部を最小〜最大に伸ばすと盤全体が
         # 軒並み色づいて、どこを高く見ているのか読めなくなる (一度そうなった)。
         # 下限は中央値より上の 70 パーセンタイルに取る
         if self.scores is not None:
@@ -172,34 +340,27 @@ class GomokuPage(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.ok, msg = available()
-        self.fly = None
-        self.meta = {}
-        if self.ok:
-            import gomoku_env as G
-
-            self.G = G
-            saved = json.loads((OUT / "gomoku_policy.json").read_text("utf-8"))
-            self.meta = saved
-            self.fly = G.FlyPlayer(saved.get("K", 6)).set_flat(np.array(saved["x"]))
-            self.n = G.N
-        else:
-            self.G = None
-            self.n = 9
+        self.brain, msg = load_brain()
+        self.ok = self.brain is not None
+        import gomoku_env as G
+        self.G = G
+        self.n = N
 
         self.board = np.zeros((self.n, self.n), dtype=np.int8)
         self.rng = np.random.default_rng()
         self.turn = HUMAN
         self.over = True
-        self.fumbles = 0
         self.human_first = True
+        self.game_id = 0
+        self._job = None                # 読んでいる最中の仕事 (握っておく)
+        self.pool = QThreadPool.globalInstance()
 
         self.view = BoardView(self.n)
         self.view.clicked.connect(self._human_move)
 
         # --- 右の帯 ---
         side = QWidget()
-        side.setFixedWidth(330)
+        side.setFixedWidth(340)
         sl = QVBoxLayout(side)
         sl.setContentsMargins(16, 14, 16, 14)
         sl.setSpacing(10)
@@ -229,9 +390,9 @@ class GomokuPage(QWidget):
         self.b_first.setChecked(True)
         sl.addLayout(btns)
 
-        # 点数を出すと、蝿が次にどこへ打つかが打つ前から分かってしまう。
+        # 目の色を出すと、蝿がどこを良いと見ているかが打つ前から分かってしまう。
         # このアプリは中を見せる側なので既定は入、対等に打ちたい人は切る
-        self.heat = QCheckBox("蝿がつけた点数を見せる (次の手も分かる)")
+        self.heat = QCheckBox("蝿の目に見えているものを重ねる")
         self.heat.setChecked(True)
         self.heat.stateChanged.connect(self._refresh)
         sl.addWidget(self.heat)
@@ -241,10 +402,10 @@ class GomokuPage(QWidget):
         self.detail.setStyleSheet(f"color:{theme.FG};font-size:12px;")
         sl.addWidget(self.detail)
 
-        note = QLabel(self._note())
-        note.setWordWrap(True)
-        note.setStyleSheet(f"color:{theme.MUTED};font-size:11px;")
-        sl.addWidget(note)
+        self.note = QLabel(self._note())
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet(f"color:{theme.MUTED};font-size:11px;")
+        sl.addWidget(self.note)
         sl.addStretch(1)
 
         lay = QHBoxLayout(self)
@@ -258,56 +419,40 @@ class GomokuPage(QWidget):
             self.detail.setText(msg)
             self.view.setEnabled(False)
         else:
+            if msg:
+                self.status.emit(msg, False)
             self.new_game(True)
 
     # --- 説明 ---
     def _note(self) -> str:
         if not self.ok:
             return ""
-        m = self.meta
-        sb = m.get("scoreboard")
-        # 強さは文章で書かず、学習のときに測った値をそのまま出す
-        # (打ち手を学習し直したら文章の方が先に古くなる)
-        strength = ""
-        if sb:
-            strength = (
-                f"実測 ({sb['games']} 局): 合法手 {sb['legal']*100:.1f} %、"
-                f"ランダムな相手に {sb['win_random']*100:.0f} % 勝ち、"
-                f"連を数える素朴な相手には {sb['win_greedy']*100:.1f} % しか勝てない。"
-                "先読みを一切していないので、人が相手だとまず勝てない。\n\n")
-        return (
-            f"覚えたもの: 重み {m.get('dim', '?')} 個を CMA-ES で決めた "
-            f"(採用したのは stage「{m.get('label', '?')}」の解)。"
-            "定石は一つも入っていない。\n\n"
-            + strength +
-            "渡した報酬は「打てた」「並べた」「止めた」「勝った」の4つだけで、"
-            "どこが良い手かは教えていない。合法手すら教えていないので、"
-            "石のあるマスを選べば空振りする (お手つき)。\n\n"
-            "盤の見方は、そのマスを通る4本の線の前後4マスを見る受容野。"
-            "重みは4方向で共有してある — 縦の三連も斜めの三連も同じ形なので、"
-            "個眼が視野のどこでも同じ受容野を持っているのと同じ作りにした。\n\n"
-            "色の濃さは蝿がつけた点数そのもの。単位が無いので、"
-            "この局面の上位3割 (70 パーセンタイル〜最大) を伸ばした相対値。\n\n"
-            "これは学習した重みで、コネクトームの回路ではない。")
+        return (self.brain.note() +
+                "色の濃さは局面ごとの上位3割を伸ばした相対値 (単位が無いので)。\n\n"
+                "これは学習した重みで、コネクトームの回路ではない。")
 
     # --- 対局 ---
     def new_game(self, human_first: bool) -> None:
         if not self.ok:
             return
+        self.game_id += 1              # 読んでいる途中の古い対局の答えは捨てる
+        # 学習を裏で回していれば網は書き換わっている。対局の頭で最新を読み直す
+        if self.brain.refresh():
+            self.note.setText(self._note())
         self.human_first = human_first
         self.b_first.setChecked(human_first)
         self.b_second.setChecked(not human_first)
         self.board[:] = 0
         self.rng = np.random.default_rng()
         self.over = False
-        self.fumbles = 0
         self.view.last = -1
         self.view.line = ()
         self.turn = HUMAN if human_first else FLY
         self.verdict.setText("あなたの番" if human_first else "蝿の番")
+        self.detail.setText("")
         self._refresh()
         if not human_first:
-            QTimer.singleShot(350, self._fly_move)
+            QTimer.singleShot(200, self._fly_move)
 
     def _human_move(self, idx: int) -> None:
         if self.over or self.turn != HUMAN:
@@ -320,31 +465,38 @@ class GomokuPage(QWidget):
         if self._check():
             return
         self.turn = FLY
-        self.verdict.setText("蝿の番")
         self._refresh()
-        QTimer.singleShot(350, self._fly_move)
+        QTimer.singleShot(150, self._fly_move)
 
     def _fly_move(self) -> None:
         if self.over or self.turn != FLY:
             return
-        s = self.fly.scores(self.board)
-        idx = int(np.argmax(s + self.rng.normal(0, 1e-6, s.size)))
+        self.verdict.setText("蝿が読んでいる…")
+        job = _MoveJob(self.brain, self.board.copy(), self.rng, self.game_id)
+        job.signals.done.connect(self._fly_done)
+        self._job = job
+        self.pool.start(job)
+
+    def _fly_done(self, game_id: int, idx: int) -> None:
+        self._job = None
+        if game_id != self.game_id or self.over or self.turn != FLY:
+            return                     # その間に新しい対局が始まった
         y, x = divmod(idx, self.n)
         if self.board[y, x] != 0:
-            # お手つき。合法手を教えていないので起こりうる。
-            # 盤は変わらないまま手番だけ移る (学習のときと同じ扱い)
-            self.fumbles += 1
-            self.turn = HUMAN
-            self.verdict.setText("蝿がお手つき — あなたの番")
+            # お手つき。前の打ち手は読みなしだと起こりうる。学習と同じくその場で負け
+            self.over = True
+            self.verdict.setText("蝿のお手つき (石のあるマスを選んだ) — あなたの勝ち")
+            self.status.emit("対局が終わりました", False)
             self._refresh()
             return
         self.board[y, x] = FLY
         self.view.last = idx
+        after = self.brain.after(self.board)
         if self._check():
             return
         self.turn = HUMAN
         self.verdict.setText("あなたの番")
-        self._refresh()
+        self._refresh(after)
 
     def _check(self) -> bool:
         """勝敗がついたか。ついたら画面を締める。"""
@@ -378,25 +530,22 @@ class GomokuPage(QWidget):
         return ()
 
     # --- 画面 ---
-    def _refresh(self) -> None:
+    def _refresh(self, after: list | None = None) -> None:
         if not self.ok:
             return
-        s = self.fly.scores(self.board)
         show = self.heat.isChecked()
+        s = self.brain.heat(self.board) if show else None
         self.view.board = self.board
-        self.view.scores = s if show else None
-        self.view.best = int(np.argmax(s)) if (show and not self.over) else -1
+        self.view.scores = s
+        # 点線の丸は「読んだ末に打つマス」。網は読みが重いので出さない
+        self.view.best = (self.brain.plan(self.board)
+                          if (show and not self.over and self.turn == HUMAN) else -1)
         self.view.update()
-
         if not show:
-            self.detail.setText(f"この対局のお手つき {self.fumbles} 回")
+            self.detail.setText("")
             return
-        order = np.argsort(s)[::-1]
-        top = order[0]
-        gap = float(s[order[0]] - s[order[1]])
-        y, x = divmod(int(top), self.n)
-        legal = "空いている" if self.board[y, x] == 0 else "石がある (お手つきになる)"
-        self.detail.setText(
-            f"蝿がいちばん高く見ているマス: {y+1} 段 {x+1} 列 — {legal}\n"
-            f"点数 {s[top]:+.3f}  (2位との差 {gap:.3f})\n"
-            f"この対局のお手つき {self.fumbles} 回")
+        top = int(np.argmax(s))
+        lines = [f"目がいちばん良いと見ているマス: {top // self.n + 1} 段 {top % self.n + 1} 列"]
+        if after:
+            lines += after
+        self.detail.setText("\n".join(lines))

@@ -1,0 +1,235 @@
+{
+ "config": {
+  "ch": 32,
+  "blocks": 3
+ },
+ "board": 15,
+ "tensors": [
+  {
+   "name": "stem.weight",
+   "shape": [
+    32,
+    3,
+    3,
+    3
+   ],
+   "offset": 0,
+   "size": 864
+  },
+  {
+   "name": "stem.bias",
+   "shape": [
+    32
+   ],
+   "offset": 864,
+   "size": 32
+  },
+  {
+   "name": "blocks.0.c1.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 896,
+   "size": 9216
+  },
+  {
+   "name": "blocks.0.c1.bias",
+   "shape": [
+    32
+   ],
+   "offset": 10112,
+   "size": 32
+  },
+  {
+   "name": "blocks.0.c2.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 10144,
+   "size": 9216
+  },
+  {
+   "name": "blocks.0.c2.bias",
+   "shape": [
+    32
+   ],
+   "offset": 19360,
+   "size": 32
+  },
+  {
+   "name": "blocks.1.c1.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 19392,
+   "size": 9216
+  },
+  {
+   "name": "blocks.1.c1.bias",
+   "shape": [
+    32
+   ],
+   "offset": 28608,
+   "size": 32
+  },
+  {
+   "name": "blocks.1.c2.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 28640,
+   "size": 9216
+  },
+  {
+   "name": "blocks.1.c2.bias",
+   "shape": [
+    32
+   ],
+   "offset": 37856,
+   "size": 32
+  },
+  {
+   "name": "blocks.2.c1.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 37888,
+   "size": 9216
+  },
+  {
+   "name": "blocks.2.c1.bias",
+   "shape": [
+    32
+   ],
+   "offset": 47104,
+   "size": 32
+  },
+  {
+   "name": "blocks.2.c2.weight",
+   "shape": [
+    32,
+    32,
+    3,
+    3
+   ],
+   "offset": 47136,
+   "size": 9216
+  },
+  {
+   "name": "blocks.2.c2.bias",
+   "shape": [
+    32
+   ],
+   "offset": 56352,
+   "size": 32
+  },
+  {
+   "name": "pol.weight",
+   "shape": [
+    1,
+    32,
+    1,
+    1
+   ],
+   "offset": 56384,
+   "size": 32
+  },
+  {
+   "name": "pol.bias",
+   "shape": [
+    1
+   ],
+   "offset": 56416,
+   "size": 1
+  },
+  {
+   "name": "val.weight",
+   "shape": [
+    8,
+    32,
+    1,
+    1
+   ],
+   "offset": 56417,
+   "size": 256
+  },
+  {
+   "name": "val.bias",
+   "shape": [
+    8
+   ],
+   "offset": 56673,
+   "size": 8
+  },
+  {
+   "name": "val_fc.0.weight",
+   "shape": [
+    32,
+    16
+   ],
+   "offset": 56681,
+   "size": 512
+  },
+  {
+   "name": "val_fc.0.bias",
+   "shape": [
+    32
+   ],
+   "offset": 57193,
+   "size": 32
+  },
+  {
+   "name": "val_fc.2.weight",
+   "shape": [
+    1,
+    32
+   ],
+   "offset": 57225,
+   "size": 32
+  },
+  {
+   "name": "val_fc.2.bias",
+   "shape": [
+    1
+   ],
+   "offset": 57257,
+   "size": 1
+  }
+ ],
+ "games_total": 84048,
+ "hours": 15.785207071436776,
+ "sims": 200,
+ "scoreboard": {
+  "games": 10,
+  "sims": 200,
+  "board": 15,
+  "素朴な相手": {
+   "win": 0.9,
+   "draw": 0.0,
+   "loss": 0.09999999999999998,
+   "plies": 28.2
+  },
+  "Rapfi 深さ1": {
+   "win": 0.4,
+   "draw": 0.0,
+   "loss": 0.6,
+   "plies": 30.3
+  }
+ },
+ "gamma": 0.95
+}

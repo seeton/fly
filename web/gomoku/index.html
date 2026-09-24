@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>蝿と五目並べ</title>
+<meta name="description" content="自分と打って勝ち負けだけから覚えた小さな網と、15x15 の自由形で五目並べを打つ。計算はすべてブラウザの中。">
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14171c; --panel2: #1b1f26; --line: #262b33;
+    --fg: #e7e9ec; --muted: #878e99; --fly: #ff9f0a; --you: #22d3ee;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 "Segoe UI Variable Text", "Segoe UI", "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; }
+  main { max-width: 1120px; margin: 0 auto; padding: 20px 16px 40px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 24px; align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .boardwrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px; width: 100%; max-width: 720px; justify-self: center; }
+  canvas { display: block; width: 100%; height: auto; touch-action: manipulation; cursor: pointer; }
+  .side { display: flex; flex-direction: column; gap: 12px; }
+  .verdict { font-size: 17px; font-weight: 700; min-height: 1.6em; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button, select { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 12px; font: inherit; font-size: 14px; cursor: pointer; }
+  button.on { border-color: var(--fly); color: var(--fly); }
+  button:hover, select:hover { border-color: #3a414c; }
+  label { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .detail { font-size: 13px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; min-height: 64px; white-space: pre-line; }
+  .note { color: var(--muted); font-size: 12.5px; }
+  .note p { margin: 0 0 8px; }
+  .note b { color: var(--fg); font-weight: 600; }
+  .legend { display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; vertical-align: -1px; margin-right: 5px; }
+  a { color: var(--you); }
+  table { border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+  td, th { border: 1px solid var(--line); padding: 3px 8px; text-align: right; }
+  .ok { color: #2be06a; } .ng { color: #ff5a4d; }
+  .thinking::after { content: " …"; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>蝿と五目並べ</h1>
+    <p class="sub">自分と打って、勝ったか負けたかだけから覚えた小さな網と打つ。15x15・自由形 (五以上で勝ち)。計算はすべてこのブラウザの中。</p>
+    <div class="boardwrap"><canvas id="board" width="720" height="720" aria-label="五目並べの盤"></canvas></div>
+  </section>
+  <aside class="side">
+    <div class="verdict" id="verdict">読み込み中</div>
+    <div class="legend"><span><span class="dot" style="background:var(--fly)"></span>蝿</span>
+      <span><span class="dot" style="background:var(--you)"></span>あなた</span></div>
+    <div class="row">
+      <button id="new">新しい対局</button>
+      <button id="first" class="on">先手で打つ</button>
+      <button id="second">後手で打つ</button>
+    </div>
+    <div class="row">
+      <label>読みの回数
+        <select id="sims">
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200" selected>200 (学習で測った強さ)</option>
+          <option value="400">400</option>
+        </select></label>
+    </div>
+    <label><input type="checkbox" id="heat" checked> 蝿の目に見えているものを重ねる (蝿の狙いが見える)</label>
+    <div class="detail" id="detail"></div>
+    <div class="note" id="note"></div>
+  </aside>
+</main>
+<script src="engine.js?v=20260924135718"></script>
+<script>
+"use strict";
+const { N, NN } = Gomoku;
+const FLY = 1, YOU = -1;
+const $ = (id) => document.getElementById(id);
+const cv = $("board"), ctx = cv.getContext("2d");
+const css = getComputedStyle(document.documentElement);
+const C = (n) => css.getPropertyValue(n).trim();
+
+let board = new Int8Array(NN), turn = YOU, over = true, youFirst = true;
+let last = -1, line = [], heat = null, gameId = 0, info = null;
+
+// ---------------- 盤を描く
+function geom() {
+  const w = cv.width, cell = w / (N + 1);
+  return { cell, o: cell };
+}
+function center(i) { const { cell, o } = geom(); return [o + (i % N) * cell, o + ((i / N) | 0) * cell]; }
+function fitCanvas() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const s = Math.round(r.width * dpr);
+  if (cv.width !== s) { cv.width = s; cv.height = s; }
+  draw();
+}
+function draw() {
+  const { cell, o } = geom(), w = cv.width;
+  ctx.fillStyle = C("--panel"); ctx.fillRect(0, 0, w, w);
+  // 蝿の目: 上位3割だけを伸ばして塗る (単位が無いので局面ごとの相対)
+  if (heat && $("heat").checked) {
+    const vals = [];
+    for (let i = 0; i < NN; i++) if (board[i] === 0) vals.push(heat[i]);
+    vals.sort((a, b) => a - b);
+    const lo = vals[Math.floor(vals.length * 0.7)] || 0, hi = vals[vals.length - 1] || 1;
+    for (let i = 0; i < NN; i++) {
+      if (board[i] !== 0) continue;
+      const v = Math.max(0, Math.min(1, (heat[i] - lo) / Math.max(hi - lo, 1e-9)));
+      if (v <= 0) continue;
+      const [x, y] = center(i);
+      ctx.fillStyle = `rgba(255,159,10,${0.55 * Math.pow(v, 1.6)})`;
+      ctx.fillRect(x - cell / 2, y - cell / 2, cell, cell);
+    }
+  }
+  ctx.strokeStyle = C("--line"); ctx.lineWidth = Math.max(1, w / 720);
+  for (let k = 0; k < N; k++) {
+    ctx.beginPath(); ctx.moveTo(o, o + k * cell); ctx.lineTo(o + (N - 1) * cell, o + k * cell); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(o + k * cell, o); ctx.lineTo(o + k * cell, o + (N - 1) * cell); ctx.stroke();
+  }
+  const r = cell * 0.42;
+  for (let i = 0; i < NN; i++) {
+    if (board[i] === 0) continue;
+    const [x, y] = center(i);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = board[i] === FLY ? C("--fly") : C("--you"); ctx.fill();
+    if (i === last) {
+      ctx.beginPath(); ctx.arc(x, y, r * 0.42, 0, Math.PI * 2);
+      ctx.strokeStyle = C("--bg"); ctx.lineWidth = Math.max(1.5, w / 360); ctx.stroke();
+    }
+  }
+  for (const i of line) {
+    const [x, y] = center(i);
+    ctx.beginPath(); ctx.arc(x, y, r * 1.15, 0, Math.PI * 2);
+    ctx.strokeStyle = C("--fg"); ctx.lineWidth = Math.max(2, w / 300); ctx.stroke();
+  }
+}
+
+// ---------------- 読み (Web Worker)
+// 版の印。書き出し (scripts/33_export_gomoku_web.py) のたびに書き換わる。
+// 古い engine.js や網がキャッシュに残って、新しい画面と混ざらないように
+const V = "?v=20260924135718";
+const worker = new Worker("worker.js" + V);
+let pending = {};
+worker.onmessage = (e) => { const m = e.data; if (pending[m.type]) pending[m.type](m); };
+// 送った種類と返ってくる種類は同じ (init だけは ready で返ってくる)
+function ask(type, payload) {
+  const reply = type === "init" ? "ready" : type;
+  return new Promise((res) => { pending[reply] = res; worker.postMessage({ type, ...payload }); });
+}
+async function refreshHeat() {
+  if (over || !$("heat").checked) { heat = null; draw(); return; }
+  const r = await ask("prior", { board: Array.from(board) });   // 蝿 = +1 の盤
+  heat = r.prior; draw();
+}
+
+// ---------------- 対局
+function setVerdict(t, thinking = false) { $("verdict").textContent = t; $("verdict").className = "verdict" + (thinking ? " thinking" : ""); }
+function check() {
+  const w = Gomoku.winner(board);
+  if (w !== 0) {
+    over = true; line = Gomoku.winningLine(board, w);
+    setVerdict(w === FLY ? "蝿の勝ち" : "あなたの勝ち"); heat = null; draw(); return true;
+  }
+  if (!board.includes(0)) { over = true; setVerdict("引き分け (盤が埋まった)"); draw(); return true; }
+  return false;
+}
+function newGame(first) {
+  youFirst = first; gameId++;
+  $("first").classList.toggle("on", first); $("second").classList.toggle("on", !first);
+  board = new Int8Array(NN); over = false; last = -1; line = []; heat = null;
+  $("detail").textContent = "";
+  turn = first ? YOU : FLY;
+  setVerdict(first ? "あなたの番" : "蝿の番");
+  draw();
+  if (first) refreshHeat(); else flyMove();
+}
+async function flyMove() {
+  if (over || turn !== FLY) return;
+  const id = gameId;
+  setVerdict("蝿が読んでいる", true);
+  const sims = +$("sims").value;
+  const r = await ask("move", { board: Array.from(board), sims, id });
+  if (id !== gameId || over) return;              // その間に新しい対局が始まった
+  board[r.move] = FLY; last = r.move;
+  const vis = r.visits, order = [...vis.keys()].sort((a, b) => vis[b] - vis[a] || a - b).slice(0, 3);
+  const pos = (i) => `${((i / N) | 0) + 1} 段 ${(i % N) + 1} 列`;
+  $("detail").textContent =
+    `蝿が打った: ${pos(r.move)}  (${sims} 回読んで ${(r.ms / 1000).toFixed(1)} 秒)\n` +
+    `読んだ回数の上位: ` + order.filter((i) => vis[i] > 0).map((i) => `${pos(i)} (${vis[i]} 回)`).join(" / ") + "\n" +
+    `打つ前の見込み (蝿から見て): ${r.value >= 0 ? "+" : ""}${r.value.toFixed(2)}  (+1 勝ち / -1 負け)`;
+  if (check()) return;
+  turn = YOU; setVerdict("あなたの番"); refreshHeat();
+}
+cv.addEventListener("click", (e) => {
+  if (over || turn !== YOU) return;
+  const rect = cv.getBoundingClientRect(), s = cv.width / rect.width, { cell, o } = geom();
+  const x = Math.round(((e.clientX - rect.left) * s - o) / cell), y = Math.round(((e.clientY - rect.top) * s - o) / cell);
+  if (x < 0 || x >= N || y < 0 || y >= N || board[y * N + x] !== 0) return;
+  board[y * N + x] = YOU; last = y * N + x; heat = null;
+  if (check()) return;
+  turn = FLY; draw(); flyMove();
+});
+$("new").onclick = () => newGame(youFirst);
+$("first").onclick = () => newGame(true);
+$("second").onclick = () => newGame(false);
+$("heat").onchange = () => refreshHeat();
+window.addEventListener("resize", fitCanvas);
+
+// ---------------- 説明
+function noteHtml(info) {
+  const sb = info.scoreboard || {};
+  const rows = Object.entries(sb).filter(([, v]) => v && typeof v === "object")
+    .map(([k, v]) => `${k}: 勝ち ${Math.round(v.win * 100)}% / 引き分け ${Math.round(v.draw * 100)}%`);
+  const games = info.games_total ? info.games_total.toLocaleString() : "?";
+  return `
+  <p><b>この蝿は何か。</b>3x3 の畳み込みを7層重ねた小さな網 (重み約5.7万個) で、自分自身と ${games} 局打ち、
+  <b>勝ったか負けたかだけ</b>を手がかりに覚えた。定石も、形の良し悪しも、「四は止めろ」も教えていない。</p>
+  <p><b>読み方。</b>その網の目で候補に重みをつけ、局面の見込みを評価しながら木を読む。読みに入れた規則は
+  「五が並んだら勝ち」「石のある所には打てない」「盤が埋まったら引き分け」だけ。候補は石から2マス以内。</p>
+  <p><b>強さ</b> (学習中に測った値、読み ${sb.sims || 200} 回、各 ${sb.games || "?"} 局、先後半々):<br>${rows.join("<br>") || "-"}<br>
+  「素朴な相手」は連の長さを数えて打つ手書きの相手、Rapfi は Gomocup で鍛えられた外のエンジン
+  (読みの深さを 1 に制限したもの)。全力の Rapfi にはまだ勝てない。</p>
+  <p>これは学習した重みで、ハエの脳 (コネクトーム) の回路ではない。
+  作り方と、途中で踏んだこと: <a href="https://github.com/seeton/fly#五目並べ--勝ち負けだけで覚えた蝿と打つ" target="_blank" rel="noopener">github.com/seeton/fly</a></p>`;
+}
+
+// ---------------- 答え合わせ (?test)
+async function selfTest() {
+  const g = await (await fetch("golden.json" + V)).json();
+  const net = await Gomoku.loadNet("", V);
+  let html = `<b>答え合わせ</b> (torch と JavaScript、読み ${g.sims} 回)<table><tr><th>#</th><th>logits 差</th><th>見込み 差</th><th>手</th><th>訪問の差</th><th>時間</th></tr>`;
+  let allOk = true;
+  for (let k = 0; k < g.cases.length; k++) {
+    const c = g.cases[k], b = Int8Array.from(c.board);
+    const f = net.forward(b, 1);
+    let dl = 0; for (let i = 0; i < NN; i++) dl = Math.max(dl, Math.abs(f.logits[i] - c.logits[i]));
+    const dv = Math.abs(f.value - c.value);
+    const t0 = performance.now(); const r = Gomoku.search(net, b, g.sims); const ms = performance.now() - t0;
+    let dvis = 0; for (let i = 0; i < NN; i++) dvis += Math.abs(r.visits[i] - c.visits[i]);
+    const ok = dl < 1e-3 && dv < 1e-4 && r.move === c.move;
+    allOk = allOk && ok;
+    html += `<tr><td>${k}</td><td>${dl.toExponential(1)}</td><td>${dv.toExponential(1)}</td>` +
+      `<td class="${r.move === c.move ? "ok" : "ng"}">${r.move === c.move ? "同じ" : r.move + " / " + c.move}</td>` +
+      `<td>${dvis}</td><td>${ms.toFixed(0)} ms</td></tr>`;
+  }
+  html += `</table><p class="${allOk ? "ok" : "ng"}">${allOk ? "すべて一致" : "食い違いあり"}</p>`;
+  $("detail").innerHTML = html;
+  document.title = allOk ? "TEST OK" : "TEST NG";
+}
+
+// ---------------- 始める
+(async () => {
+  fitCanvas();
+  const r = await ask("init", { base: "", v: V });
+  info = r.info;
+  $("note").innerHTML = noteHtml(info);
+  // 端末の速さに合わせて読みの回数の初期値を決める。学習で測ったのは 200 回だが、
+  // 遅い端末では1手に何秒も待たされるので 100 回に下げる (そのぶん少し弱くなる)
+  const ms = r.msPerEval, est = (n) => (n * ms * 1.1 / 1000);
+  for (const o of $("sims").options) o.textContent = o.textContent.replace(/ \(約.*\)$/, "") + ` (約 ${est(+o.value).toFixed(1)} 秒)`;
+  const std = info.sims || 200;
+  $("sims").value = est(std) <= 3 ? String(std) : est(100) <= 4 ? "100" : "50";
+  if (location.search.includes("test")) { setVerdict("答え合わせ中"); await selfTest(); setVerdict("答え合わせ"); return; }
+  newGame(true);
+})();
+</script>
+</body>
+</html>

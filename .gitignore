@@ -22,7 +22,13 @@ MUJOCO_LOG.TXT
 !out/
 out/*
 !out/*.json
+# 五目並べの網 (700 KB)。アプリがこれで打つ。linerush は自己対戦が崩れたときの記録
+!out/gomoku_net.pt
+!out/gomoku_net_linerush.pt
 
 # Claude 用のローカルメモ (引き継ぎメモも含む)
 CLAUDE.md
 HANDOFF.md
+
+# 外部エンジン (Rapfi) のソースとビルド物。物差しとして使うだけで同梱しない
+tools/
