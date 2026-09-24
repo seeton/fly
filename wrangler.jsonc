@@ -1,0 +1,15 @@
+// Cloudflare Workers で五目並べ (web/gomoku/) だけを公開する設定。
+//
+// 静的なファイルを配るだけで、Worker のスクリプトは無い。網の計算も読みも
+// ブラウザの中 (web/gomoku/engine.js) で回るので、サーバ側で動くものは無い。
+// 蝿脳ビューアやデータ (data/、out/) は含めない。
+//
+// name は Cloudflare のダッシュボードで作った Worker の名前と同じにする
+// (違うと Workers Builds がデプロイを弾く)。
+{
+  "name": "fly-gomoku",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./web/gomoku"
+  }
+}
